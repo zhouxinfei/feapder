@@ -6,14 +6,21 @@ BatchSpider是一款分布式批次爬虫，对于需要周期性采集的数据
 
 参考 [Spider](usage/Spider?id=_1-创建项目)
 
-
 ## 2. 创建爬虫
 
 命令参考：[命令行工具](command/cmdline.md?id=_2-创建爬虫)
 
 示例:
 
-    feapder create -s batch_spider_test 3
+```python
+feapder create -s batch_spider_test
+
+请选择爬虫模板
+  AirSpider
+  Spider
+  TaskSpider
+> BatchSpider
+```
 
 生成如下
 
@@ -43,7 +50,7 @@ class BatchSpiderTest(feapder.BatchSpider):
 
 if __name__ == "__main__":
     spider = BatchSpiderTest(
-        redis_key="xxx:xxxx",  # redis中存放任务等信息的根key
+        redis_key="xxx:xxxx",  # 分布式爬虫调度信息存储位置
         task_table="",  # mysql中的任务表
         task_keys=["id", "xxx"],  # 需要获取任务表里的字段名，可添加多个
         task_state="state",  # mysql中任务状态字段
@@ -138,7 +145,7 @@ def start_requests(self, task):
 ```
 def crawl_test(args):
     spider = test_spider.TestSpider(
-        redis_key="feapder:test_batch_spider",  # redis中存放任务等信息的根key
+        redis_key="feapder:test_batch_spider",  # 分布式爬虫调度信息存储位置
         task_table="batch_spider_task",  # mysql中的任务表
         task_keys=["id", "url"],  # 需要获取任务表里的字段名，可添加多个
         task_state="state",  # mysql中任务状态字段
@@ -252,7 +259,7 @@ def failed_request(self, request, response):
 def test_debug():
     spider = test_spider.TestSpider.to_DebugBatchSpider(
         task_id=1,
-        redis_key="feapder:test_batch_spider",  # redis中存放任务等信息的根key
+        redis_key="feapder:test_batch_spider",  # 分布式爬虫调度信息存储位置
         task_table="batch_spider_task",  # mysql中的任务表
         task_keys=["id", "url"],  # 需要获取任务表里的字段名，可添加多个
         task_state="state",  # mysql中任务状态字段
@@ -283,7 +290,7 @@ from feapder import ArgumentParser
 
 def crawl_test(args):
     spider = test_spider.TestSpider(
-        redis_key="feapder:test_batch_spider",  # redis中存放任务等信息的根key
+        redis_key="feapder:test_batch_spider",  # 分布式爬虫调度信息存储位置
         task_table="batch_spider_task",  # mysql中的任务表
         task_keys=["id", "url"],  # 需要获取任务表里的字段名，可添加多个
         task_state="state",  # mysql中任务状态字段

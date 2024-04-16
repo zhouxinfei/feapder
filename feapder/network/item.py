@@ -8,6 +8,8 @@ Created on 2018-07-26 22:28:10
 @email:  boris_liu@foxmail.com
 """
 
+import re
+
 import feapder.utils.tools as tools
 
 
@@ -36,6 +38,20 @@ class Item(metaclass=ItemMetaclass):
 
     def __setitem__(self, key, value):
         self.__dict__[key] = value
+
+    def update(self, *args, **kwargs):
+        """
+        更新字段，与字典使用方法一致
+        """
+        self.__dict__.update(*args, **kwargs)
+
+    def update_strict(self, *args, **kwargs):
+        """
+        更新严格更新，只更新item中有的字段
+        """
+        for key, value in dict(*args, **kwargs).items():
+            if key in self.__dict__:
+                self.__dict__[key] = value
 
     def pre_to_db(self):
         """
@@ -72,12 +88,12 @@ class Item(metaclass=ItemMetaclass):
     @item_name.setter
     def item_name(self, name):
         self.__name__ = name
-        self.__table_name__ = self.name_underline.replace("_item", "")
+        self.__table_name__ = re.sub("_item$", "", self.name_underline)
 
     @property
     def table_name(self):
         if not self.__table_name__:
-            self.__table_name__ = self.name_underline.replace("_item", "")
+            self.__table_name__ = re.sub("_item$", "", self.name_underline)
         return self.__table_name__
 
     @table_name.setter

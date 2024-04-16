@@ -11,7 +11,8 @@ Created on 2018-07-26 11:40:28
 import datetime
 import os
 import re
-import time
+import tempfile
+import webbrowser
 from urllib.parse import urlparse, urlunparse, urljoin
 
 from bs4 import UnicodeDammit, BeautifulSoup
@@ -19,6 +20,7 @@ from requests.cookies import RequestsCookieJar
 from requests.models import Response as res
 from w3lib.encoding import http_content_type_encoding, html_body_declared_encoding
 
+from feapder import setting
 from feapder.network.selector import Selector
 from feapder.utils.log import log
 
@@ -36,9 +38,21 @@ SPECIAL_CHARACTER_PATTERNS = [
 
 
 class Response(res):
-    def __init__(self, response):
+    def __init__(self, response, make_absolute_links=None):
+        """
+
+        Args:
+            response: requests请求返回的response
+            make_absolute_links: 是否自动补全url
+        """
         super(Response, self).__init__()
         self.__dict__.update(response.__dict__)
+
+        self.make_absolute_links = (
+            make_absolute_links
+            if make_absolute_links is not None
+            else setting.MAKE_ABSOLUTE_LINKS
+        )
 
         self._cached_selector = None
         self._cached_text = None
@@ -47,6 +61,27 @@ class Response(res):
         self._encoding = None
 
         self.encoding_errors = "strict"  # strict / replace / ignore
+        self.browser = self.driver = None
+
+    @classmethod
+    def from_text(
+        cls,
+        text: str,
+        url: str = "",
+        cookies: dict = None,
+        headers: dict = None,
+        encoding="utf-8",
+    ):
+        response_dict = {
+            "_content": text.encode(encoding=encoding),
+            "cookies": cookies or {},
+            "encoding": encoding,
+            "headers": headers or {},
+            "status_code": 200,
+            "elapsed": 0,
+            "url": url,
+        }
+        return cls.from_dict(response_dict)
 
     @classmethod
     def from_dict(cls, response_dict):
@@ -176,10 +211,10 @@ class Response(res):
 
     def _absolute_links(self, text):
         regexs = [
-            r'(<(?i)a.*?href\s*?=\s*?["\'])(.+?)(["\'])',  # a
-            r'(<(?i)img.*?src\s*?=\s*?["\'])(.+?)(["\'])',  # img
-            r'(<(?i)link.*?href\s*?=\s*?["\'])(.+?)(["\'])',  # css
-            r'(<(?i)script.*?src\s*?=\s*?["\'])(.+?)(["\'])',  # js
+            r'(<a.*?href\s*?=\s*?["\'])(.+?)(["\'])',  # a
+            r'(<img.*?src\s*?=\s*?["\'])(.+?)(["\'])',  # img
+            r'(<link.*?href\s*?=\s*?["\'])(.+?)(["\'])',  # css
+            r'(<script.*?src\s*?=\s*?["\'])(.+?)(["\'])',  # js
         ]
 
         for regex in regexs:
@@ -192,7 +227,7 @@ class Response(res):
                 # return re.sub(regex, r'\1{}\3'.format(absolute_link), html) # 使用正则替换，个别字符不支持。如该网址源代码http://permit.mep.gov.cn/permitExt/syssb/xxgk/xxgk!showImage.action?dataid=0b092f8115ff45c5a50947cdea537726
                 return text.group(1) + absolute_link + text.group(3)
 
-            text = re.sub(regex, replace_href, text, flags=re.S)
+            text = re.sub(regex, replace_href, text, flags=re.S | re.I)
 
         return text
 
@@ -239,15 +274,27 @@ class Response(res):
     def text(self):
         if self._cached_text is None:
             if self.encoding and self.encoding.upper() != FAIL_ENCODING:
-                self._cached_text = self.__text
+                try:
+                    self._cached_text = self.__text
+                except UnicodeDecodeError:
+                    self._cached_text = self._get_unicode_html(self.content)
             else:
                 self._cached_text = self._get_unicode_html(self.content)
 
             if self._cached_text:
-                self._cached_text = self._absolute_links(self._cached_text)
+                if self.make_absolute_links:
+                    self._cached_text = self._absolute_links(self._cached_text)
                 self._cached_text = self._del_special_character(self._cached_text)
 
         return self._cached_text
+
+    @text.setter
+    def text(self, html):
+        self._cached_text = html
+        if self.make_absolute_links:
+            self._cached_text = self._absolute_links(self._cached_text)
+        self._cached_text = self._del_special_character(self._cached_text)
+        self._cached_selector = Selector(self.text)
 
     @property
     def json(self, **kwargs):
@@ -326,16 +373,21 @@ class Response(res):
 
         return self.selector.re_first(regex, default, replace_entities)
 
+    def close_browser(self, request):
+        if self.browser:
+            request.render_downloader.close(self.browser)
+
     def __del__(self):
         self.close()
 
-    def open(self, delete_temp_file=False):
-        with open("temp.html", "w", encoding=self.encoding, errors="replace") as html:
-            self.encoding_errors = "replace"
-            html.write(self.text)
+    def open(self):
+        body = self.content
+        if b"<base" not in body:
+            # <head> 标签后插入一个<base href="url">标签
+            repl = fr'\1<base href="{self.url}">'
+            body = re.sub(rb"(<head(?:>|\s.*?>))", repl.encode("utf-8"), body)
 
-        os.system("open temp.html")
-
-        if delete_temp_file:
-            time.sleep(1)
-            os.remove("temp.html")
+        fd, fname = tempfile.mkstemp(".html")
+        os.write(fd, body)
+        os.close(fd)
+        return webbrowser.open(f"file://{fname}")

@@ -5,7 +5,7 @@ Created on 2018/12/13 4:11 PM
 @summary:
 ---------
 @author: Boris
-@email: boris@bzkj.tech
+@email: boris_liu@foxmail.com
 """
 
 import hashlib
@@ -14,7 +14,7 @@ import threading
 import time
 from struct import unpack, pack
 
-from feapder.db.redisdb import RedisDB
+from feapder.dedup.basefilter import BaseFilter
 from feapder.utils.redis_lock import RedisLock
 from . import bitarray
 
@@ -146,24 +146,18 @@ class BloomFilter(object):
         比较耗时 半小时检查一次
         @return:
         """
-        # if self._is_at_capacity:
-        #     return self._is_at_capacity
-        #
-        # if not self._check_capacity_time or time.time() - self._check_capacity_time > 1800:
-        #     bit_count = self.bitarray.count()
-        #     if bit_count and bit_count / self.num_bits > 0.5:
-        #         self._is_at_capacity = True
-        #
-        #     self._check_capacity_time = time.time()
-        #
-        # return self._is_at_capacity
-
         if self._is_at_capacity:
             return self._is_at_capacity
 
-        bit_count = self.bitarray.count()
-        if bit_count and bit_count / self.num_bits > 0.5:
-            self._is_at_capacity = True
+        if (
+            not self._check_capacity_time
+            or time.time() - self._check_capacity_time > 1800
+        ):
+            bit_count = self.bitarray.count()
+            if bit_count and bit_count / self.num_bits > 0.5:
+                self._is_at_capacity = True
+
+            self._check_capacity_time = time.time()
 
         return self._is_at_capacity
 
@@ -174,8 +168,8 @@ class BloomFilter(object):
         @param keys: list or one key
         @return:
         """
-        if self.is_at_capacity:
-            raise IndexError("BloomFilter is at capacity")
+        # if self.is_at_capacity:
+        #     raise IndexError("BloomFilter is at capacity")
 
         is_list = isinstance(keys, list)
 
@@ -197,7 +191,7 @@ class BloomFilter(object):
         return is_added if is_list else is_added[0]
 
 
-class ScalableBloomFilter(object):
+class ScalableBloomFilter(BaseFilter):
     """
     自动扩展空间的bloomfilter, 当一个filter满一半的时候，创建下一个
     """
@@ -267,12 +261,13 @@ class ScalableBloomFilter(object):
 
                     self._check_capacity_time = time.time()
             else:
-                with RedisLock(
-                    key="ScalableBloomFilter",
-                    timeout=300,
-                    wait_timeout=300,
-                    redis_cli=RedisDB(url=self.redis_url).get_redis_obj(),
-                ) as lock:  # 全局锁 同一时间只有一个进程在真正的创建新的filter，等这个进程创建完，其他进程只是把刚创建的filter append进来
+                # 全局锁 同一时间只有一个进程在真正的创建新的filter，等这个进程创建完，其他进程只是把刚创建的filter append进来
+                key = (
+                    f"ScalableBloomFilter:{self.name}"
+                    if self.name
+                    else "ScalableBloomFilter"
+                )
+                with RedisLock(key=key, redis_url=self.redis_url) as lock:
                     if lock.locked:
                         while True:
                             if self.filters[-1].is_at_capacity:

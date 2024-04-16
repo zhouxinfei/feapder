@@ -20,7 +20,7 @@ from feapder.utils.log import log
 # 建立本地缓存代理文件夹
 proxy_path = os.path.join(os.path.dirname(__file__), "proxy_file")
 if not os.path.exists(proxy_path):
-    os.mkdir(proxy_path)
+    os.makedirs(proxy_path, exist_ok=True)
 
 
 def get_proxies_by_host(host, port):
@@ -31,16 +31,9 @@ def get_proxies_by_host(host, port):
 def get_proxies_by_id(proxy_id):
     proxies = {
         "http": "http://{}".format(proxy_id),
-        "https": "https://{}".format(proxy_id),
+        "https": "http://{}".format(proxy_id),
     }
     return proxies
-
-
-# 代理类型定义
-class LimitProxy(object):
-    """提取次数有限制的代理"""
-
-    pass
 
 
 def get_proxy_from_url(**kwargs):
@@ -133,7 +126,7 @@ def get_proxy_from_file(filename, **kwargs):
             ip = "{}@{}".format(auth, ip)
         if not protocol:
             proxies = {
-                "https": "https://%s:%s" % (ip, port),
+                "https": "http://%s:%s" % (ip, port),
                 "http": "http://%s:%s" % (ip, port),
             }
         else:
@@ -151,7 +144,7 @@ def get_proxy_from_redis(proxy_source_url, **kwargs):
         ip:port ts
     @param kwargs:
         {"redis_proxies_key": "xxx"}
-    @return: [{'http':'http://xxx.xxx.xxx:xxx', 'https':'https://xxx.xxx.xxx.xxx:xxx'}]
+    @return: [{'http':'http://xxx.xxx.xxx:xxx', 'https':'http://xxx.xxx.xxx.xxx:xxx'}]
     """
 
     redis_conn = redis.StrictRedis.from_url(proxy_source_url)
@@ -162,7 +155,7 @@ def get_proxy_from_redis(proxy_source_url, **kwargs):
     for proxy in proxies:
         proxy = proxy.decode()
         proxies_list.append(
-            {"https": "https://%s" % proxy, "http": "http://%s" % proxy}
+            {"https": "http://%s" % proxy, "http": "http://%s" % proxy}
         )
     return proxies_list
 
@@ -205,7 +198,7 @@ def check_proxy(
         if not proxies:
             proxies = {
                 "http": "http://{}:{}".format(ip, port),
-                "https": "https://{}:{}".format(ip, port),
+                "https": "http://{}:{}".format(ip, port),
             }
         try:
             r = requests.get(
@@ -391,6 +384,9 @@ class ProxyPool(ProxyPoolBase):
         :param logger: 日志处理器 默认 log.get_logger()
         :param kwargs: 其他的参数
         """
+        kwargs.setdefault("size", -1)
+        kwargs.setdefault("proxy_source_url", setting.PROXY_EXTRACT_API)
+
         super(ProxyPool, self).__init__(**kwargs)
         # 队列最大长度
         self.max_queue_size = kwargs.get("size", -1)
@@ -423,7 +419,7 @@ class ProxyPool(ProxyPoolBase):
         self.proxy_dict = {}
         # 失效代理队列
         self.invalid_proxy_dict = {}
-        #
+
         self.kwargs = kwargs
 
         # 重置代理池锁
@@ -707,9 +703,3 @@ class ProxyPool(ProxyPoolBase):
         :return:
         """
         return get_proxy_from_url(**self.kwargs)
-
-
-if not setting.PROXY_ENABLE or not setting.PROXY_EXTRACT_API:
-    proxy_pool = None
-else:
-    proxy_pool = ProxyPool(size=-1, proxy_source_url=setting.PROXY_EXTRACT_API)

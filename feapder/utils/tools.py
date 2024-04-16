@@ -5,20 +5,25 @@ Created on 2018-09-06 14:21
 @summary: 工具
 ---------
 @author: Boris
-@email: boris@bzkj.tech
+@email: boris_liu@foxmail.com
 """
+import asyncio
+import base64
 import calendar
 import codecs
 import configparser  # 读配置文件的
 import datetime
 import functools
 import hashlib
+import hmac
 import html
+import importlib
 import json
 import os
 import pickle
 import random
 import re
+import signal
 import socket
 import ssl
 import string
@@ -29,13 +34,13 @@ import urllib
 import urllib.parse
 import uuid
 import weakref
+from functools import partial, wraps
 from hashlib import md5
 from pprint import pformat
 from pprint import pprint
 from urllib import request
 from urllib.parse import urljoin
 
-import execjs  # pip install PyExecJS
 import redis
 import requests
 import six
@@ -43,8 +48,14 @@ from requests.cookies import RequestsCookieJar
 from w3lib.url import canonicalize_url as _canonicalize_url
 
 import feapder.setting as setting
+from feapder.db.redisdb import RedisDB
 from feapder.utils.email_sender import EmailSender
 from feapder.utils.log import log
+
+try:
+    import execjs  # pip install PyExecJS
+except Exception as e:
+    pass
 
 os.environ["EXECJS_RUNTIME"] = "Node"  # 设置使用node执行js
 
@@ -60,14 +71,7 @@ redisdb = None
 def get_redisdb():
     global redisdb
     if not redisdb:
-        ip, port = setting.REDISDB_IP_PORTS.split(":")
-        redisdb = redis.Redis(
-            host=ip,
-            port=port,
-            db=setting.REDISDB_DB,
-            password=setting.REDISDB_USER_PASS,
-            decode_responses=True,
-        )  # redis默认端口是6379
+        redisdb = RedisDB()
     return redisdb
 
 
@@ -81,6 +85,23 @@ class Singleton(object):
         if self._cls not in self._instance:
             self._instance[self._cls] = self._cls(*args, **kwargs)
         return self._instance[self._cls]
+
+
+class LazyProperty:
+    """
+    属性延时初始化，且只初始化一次
+    """
+
+    def __init__(self, func):
+        self.func = func
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        else:
+            value = self.func(instance)
+            setattr(instance, self.func.__name__, value)
+            return value
 
 
 def log_function_time(func):
@@ -136,6 +157,100 @@ def memoizemethod_noargs(method):
         return cache[self]
 
     return new_method
+
+
+def retry(retry_times=3, interval=0):
+    """
+    普通函数的重试装饰器
+    Args:
+        retry_times: 重试次数
+        interval: 每次重试之间的间隔
+
+    Returns:
+
+    """
+
+    def _retry(func):
+        @functools.wraps(func)  # 将函数的原来属性付给新函数
+        def wapper(*args, **kwargs):
+            for i in range(retry_times):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    log.error(
+                        "函数 {} 执行失败 重试 {} 次. error {}".format(func.__name__, i + 1, e)
+                    )
+                    time.sleep(interval)
+                    if i + 1 >= retry_times:
+                        raise e
+
+        return wapper
+
+    return _retry
+
+
+def retry_asyncio(retry_times=3, interval=0):
+    """
+    协程的重试装饰器
+    Args:
+        retry_times: 重试次数
+        interval: 每次重试之间的间隔
+
+    Returns:
+
+    """
+
+    def _retry(func):
+        @functools.wraps(func)  # 将函数的原来属性付给新函数
+        async def wapper(*args, **kwargs):
+            for i in range(retry_times):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    log.error(
+                        "函数 {} 执行失败 重试 {} 次. error {}".format(func.__name__, i + 1, e)
+                    )
+                    await asyncio.sleep(interval)
+                    if i + 1 >= retry_times:
+                        raise e
+
+        return wapper
+
+    return _retry
+
+
+def func_timeout(timeout):
+    """
+    函数运行时间限制装饰器
+    注: 不支持window
+    Args:
+        timeout: 超时的时间
+
+    Eg:
+        @set_timeout(3)
+        def test():
+            ...
+
+    Returns:
+
+    """
+
+    def wapper(func):
+        def handle(
+            signum, frame
+        ):  # 收到信号 SIGALRM 后的回调函数，第一个参数是信号的数字，第二个参数是the interrupted stack frame.
+            raise TimeoutError
+
+        def new_method(*args, **kwargs):
+            signal.signal(signal.SIGALRM, handle)  # 设置信号和回调函数
+            signal.alarm(timeout)  # 设置 timeout 秒的闹钟
+            r = func(*args, **kwargs)
+            signal.alarm(0)  # 关闭闹钟
+            return r
+
+        return new_method
+
+    return wapper
 
 
 ########################【网页解析相关】###############################
@@ -217,6 +332,30 @@ def get_json_by_requests(
 
 def get_cookies(response):
     cookies = requests.utils.dict_from_cookiejar(response.cookies)
+    return cookies
+
+
+def get_cookies_from_str(cookie_str):
+    """
+    >>> get_cookies_from_str("key=value; key2=value2; key3=; key4=; ")
+    {'key': 'value', 'key2': 'value2', 'key3': '', 'key4': ''}
+
+    Args:
+        cookie_str: key=value; key2=value2; key3=; key4=
+
+    Returns:
+
+    """
+    cookies = {}
+    for cookie in cookie_str.split(";"):
+        cookie = cookie.strip()
+        if not cookie:
+            continue
+        key, value = cookie.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        cookies[key] = value
+
     return cookies
 
 
@@ -369,12 +508,62 @@ def fit_url(urls, identis):
 
 
 def get_param(url, key):
-    params = url.split("?")[-1].split("&")
+    match = re.search(f"{key}=([^&]+)", url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def get_all_params(url):
+    """
+    >>> get_all_params("https://www.baidu.com/s?wd=feapder")
+    {'wd': 'feapder'}
+    """
+    params_json = {}
+    params = url.split("?", 1)[-1].split("&")
     for param in params:
         key_value = param.split("=", 1)
-        if key == key_value[0]:
-            return key_value[1]
-    return None
+        if len(key_value) == 2:
+            params_json[key_value[0]] = unquote_url(key_value[1])
+        else:
+            params_json[key_value[0]] = ""
+
+    return params_json
+
+
+def parse_url_params(url):
+    """
+    解析url参数
+    :param url:
+    :return:
+
+    >>> parse_url_params("https://www.baidu.com/s?wd=%E4%BD%A0%E5%A5%BD")
+    ('https://www.baidu.com/s', {'wd': '你好'})
+    >>> parse_url_params("wd=%E4%BD%A0%E5%A5%BD")
+    ('', {'wd': '你好'})
+    >>> parse_url_params("https://www.baidu.com/s?wd=%E4%BD%A0%E5%A5%BD&pn=10")
+    ('https://www.baidu.com/s', {'wd': '你好', 'pn': '10'})
+    >>> parse_url_params("wd=%E4%BD%A0%E5%A5%BD&pn=10")
+    ('', {'wd': '你好', 'pn': '10'})
+    >>> parse_url_params("https://www.baidu.com")
+    ('https://www.baidu.com', {})
+    >>> parse_url_params("https://www.spidertools.cn/#/")
+    ('https://www.spidertools.cn/#/', {})
+    """
+    root_url = ""
+    params = {}
+    if "?" not in url:
+        if re.search("[&=]", url) and not re.search("/", url):
+            # 只有参数
+            params = get_all_params(url)
+        else:
+            root_url = url
+
+    else:
+        root_url = url.split("?", 1)[0]
+        params = get_all_params(url)
+
+    return root_url, params
 
 
 def urlencode(params):
@@ -403,7 +592,7 @@ def urldecode(url):
     params_json = {}
     params = url.split("?")[-1].split("&")
     for param in params:
-        key, value = param.split("=")
+        key, value = param.split("=", 1)
         params_json[key] = unquote_url(value)
 
     return params_json
@@ -573,20 +762,8 @@ def get_form_data(form):
     return data
 
 
-# mac上不好使
-# def get_domain(url):
-#     domain = ''
-#     try:
-#         domain = get_tld(url)
-#     except Exception as e:
-#         log.debug(e)
-#     return domain
-
-
 def get_domain(url):
-    proto, rest = urllib.parse.splittype(url)
-    domain, rest = urllib.parse.splithost(rest)
-    return domain
+    return urllib.parse.urlparse(url).netloc
 
 
 def get_index_url(url):
@@ -609,6 +786,8 @@ def get_localhost_ip():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
+    except:
+        ip = ""
     finally:
         if s:
             s.close()
@@ -685,36 +864,46 @@ def get_text(soup, *args):
         return ""
 
 
-def del_html_tag(content, except_line_break=False, save_img=False, white_replaced=""):
+def del_html_tag(content, save_line_break=True, save_p=False, save_img=False):
     """
     删除html标签
     @param content: html内容
-    @param except_line_break: 保留p标签
-    @param save_img: 保留图片
-    @param white_replaced: 空白符替换
+    @param save_p: 保留p标签
+    @param save_img: 保留图片标签
+    @param save_line_break: 保留\n换行
     @return:
     """
-    content = replace_str(content, "(?i)<script(.|\n)*?</script>")  # (?)忽略大小写
-    content = replace_str(content, "(?i)<style(.|\n)*?</style>")
-    content = replace_str(content, "<!--(.|\n)*?-->")
-    content = replace_str(
-        content, "(?!&[a-z]+=)&[a-z]+;?"
-    )  # 干掉&nbsp等无用的字符 但&xxx= 这种表示参数的除外
-    if except_line_break:
-        content = content.replace("</p>", "/p")
-        content = replace_str(content, "<[^p].*?>")
-        content = content.replace("/p", "</p>")
-        content = replace_str(content, "[ \f\r\t\v]")
+    if not content:
+        return content
+    # js
+    content = re.sub("(?i)<script(.|\n)*?</script>", "", content)  # (?)忽略大小写
+    # css
+    content = re.sub("(?i)<style(.|\n)*?</style>", "", content)  # (?)忽略大小写
+    # 注释
+    content = re.sub("<!--(.|\n)*?-->", "", content)
+    # 干掉&nbsp;等无用的字符 但&xxx= 这种表示参数的除外
+    content = re.sub("(?!&[a-z]+=)&[a-z]+;?", "", content)
 
+    if save_p and save_img:
+        content = re.sub("<(?!(p[ >]|/p>|img ))(.|\n)+?>", "", content)
+    elif save_p:
+        content = re.sub("<(?!(p[ >]|/p>))(.|\n)+?>", "", content)
     elif save_img:
-        content = replace_str(content, "(?!<img.+?>)<.+?>")  # 替换掉除图片外的其他标签
-        content = replace_str(content, "(?! +)\s+", "\n")  # 保留空格
-        content = content.strip()
-
+        content = re.sub("<(?!img )(.|\n)+?>", "", content)
+    elif save_line_break:
+        content = re.sub("<(?!/p>)(.|\n)+?>", "", content)
+        content = re.sub("</p>", "\n", content)
     else:
-        content = replace_str(content, "<(.|\n)*?>")
-        content = replace_str(content, "\s", white_replaced)
-        content = content.strip()
+        content = re.sub("<(.|\n)*?>", "", content)
+
+    if save_line_break:
+        # 把非换行符的空白符替换为一个空格
+        content = re.sub("[^\S\n]+", " ", content)
+        # 把多个换行符替换为一个换行符 如\n\n\n 或 \n \n \n 替换为\n
+        content = re.sub("(\n ?)+", "\n", content)
+    else:
+        content = re.sub("\s+", " ", content)
+    content = content.strip()
 
     return content
 
@@ -798,27 +987,31 @@ def jsonp2json(jsonp):
         raise ValueError("Invalid Input")
 
 
-def dumps_json(json_, indent=4, sort_keys=False):
+def dumps_json(data, indent=4, sort_keys=False):
     """
     @summary: 格式化json 用于打印
     ---------
-    @param json_: json格式的字符串或json对象
+    @param data: json格式的字符串或json对象
     ---------
     @result: 格式化后的字符串
     """
     try:
-        if isinstance(json_, str):
-            json_ = get_json(json_)
+        if isinstance(data, str):
+            data = get_json(data)
 
-        json_ = json.dumps(
-            json_, ensure_ascii=False, indent=indent, skipkeys=True, sort_keys=sort_keys
+        data = json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=indent,
+            skipkeys=True,
+            sort_keys=sort_keys,
+            default=str,
         )
 
     except Exception as e:
-        log.error(e)
-        json_ = pformat(json_)
+        data = pformat(data)
 
-    return json_
+    return data
 
 
 def get_json_value(json_object, key):
@@ -916,9 +1109,30 @@ def get_conf_value(config_file, section, key):
 
 def mkdir(path):
     try:
-        os.makedirs(path)
+        if not os.path.exists(path):
+            os.makedirs(path)
     except OSError as exc:  # Python >2.5
         pass
+
+
+def get_cache_path(filename, root_dir=None, local=False):
+    """
+    Args:
+        filename:
+        root_dir:
+        local: 是否存储到当前目录
+
+    Returns:
+
+    """
+    if root_dir is None:
+        if local:
+            root_dir = os.path.join(sys.path[0], ".cache")
+        else:
+            root_dir = os.path.join(os.path.expanduser("~"), ".feapder/cache")
+    file_path = f"{root_dir}{os.sep}{filename}"
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    return f"{root_dir}{os.sep}{filename}"
 
 
 def write_file(filename, content, mode="w", encoding="utf-8"):
@@ -961,10 +1175,10 @@ def read_file(filename, readlines=False, encoding="utf-8"):
 def get_oss_file_list(oss_handler, prefix, date_range_min, date_range_max=None):
     """
     获取文件列表
-    @param prefix: 路径前缀 如 data/car_service_line/yiche/yiche_serial_zongshu_info
+    @param prefix: 路径前缀 如 xxx/xxx
     @param date_range_min: 时间范围 最小值 日期分隔符为/ 如 2019/03/01 或 2019/03/01/00/00/00
     @param date_range_max: 时间范围 最大值 日期分隔符为/ 如 2019/03/01 或 2019/03/01/00/00/00
-    @return: 每个文件路径 如 html/e_commerce_service_line/alibaba/alibaba_shop_info/2019/03/22/15/53/15/8ca8b9e4-4c77-11e9-9dee-acde48001122.json.snappy
+    @return: 每个文件路径 如 html/xxx/xxx/2019/03/22/15/53/15/8ca8b9e4-4c77-11e9-9dee-acde48001122.json.snappy
     """
 
     # 计算时间范围
@@ -1020,8 +1234,19 @@ def is_exist(file_path):
     return os.path.exists(file_path)
 
 
-def download_file(url, base_path, filename="", call_func="", proxies=None, data=None):
-    file_path = base_path + filename
+def download_file(url, file_path, *, call_func=None, proxies=None, data=None):
+    """
+    下载文件，会自动创建文件存储目录
+    Args:
+        url: 地址
+        file_path: 文件存储地址
+        call_func: 下载成功的回调
+        proxies: 代理
+        data: 请求体
+
+    Returns:
+
+    """
     directory = os.path.dirname(file_path)
     mkdir(directory)
 
@@ -1041,13 +1266,6 @@ def download_file(url, base_path, filename="", call_func="", proxies=None, data=
 
     if url:
         try:
-            log.debug(
-                """
-                         正在下载 %s
-                         存储路径 %s
-                      """
-                % (url, file_path)
-            )
             if proxies:
                 # create the object, assign it to a variable
                 proxy = request.ProxyHandler(proxies)
@@ -1058,15 +1276,8 @@ def download_file(url, base_path, filename="", call_func="", proxies=None, data=
 
             request.urlretrieve(url, file_path, progress_callfunc, data)
 
-            log.debug(
-                """
-                         下载完毕 %s
-                         文件路径 %s
-                      """
-                % (url, file_path)
-            )
-
-            call_func and call_func()
+            if callable(call_func):
+                call_func()
             return 1
         except Exception as e:
             log.error(e)
@@ -1176,8 +1387,6 @@ def compile_js(js_func):
     ctx = execjs.compile(js_func)
     return ctx.call
 
-
-###############################################
 
 #############################################
 
@@ -1467,7 +1676,7 @@ def format_date(date, old_format="", new_format="%Y-%m-%d %H:%M:%S"):
         %S 秒（00-59）
     @param new_format: 输出的日期格式
     ---------
-    @result: 格式化后的日期，类型为字符串 如2017-4-17 3:27:12
+    @result: 格式化后的日期，类型为字符串 如2017-4-17 03:27:12
     """
     if not date:
         return ""
@@ -1500,45 +1709,101 @@ def format_date(date, old_format="", new_format="%Y-%m-%d %H:%M:%S"):
     return date_str
 
 
+def transform_lower_num(data_str: str):
+    num_map = {
+        "一": "1",
+        "二": "2",
+        "两": "2",
+        "三": "3",
+        "四": "4",
+        "五": "5",
+        "六": "6",
+        "七": "7",
+        "八": "8",
+        "九": "9",
+        "十": "0",
+    }
+    pattern = f'[{"|".join(num_map.keys())}|零]'
+    res = re.search(pattern, data_str)
+    if not res:
+        #  如果字符串中没有包含中文数字 不做处理 直接返回
+        return data_str
+
+    data_str = data_str.replace("0", "零")
+    for n in num_map:
+        data_str = data_str.replace(n, num_map[n])
+
+    re_data_str = re.findall("\d+", data_str)
+    for i in re_data_str:
+        if len(i) == 3:
+            new_i = i.replace("0", "")
+            data_str = data_str.replace(i, new_i, 1)
+        elif len(i) == 4:
+            new_i = i.replace("10", "")
+            data_str = data_str.replace(i, new_i, 1)
+        elif len(i) == 2 and int(i) < 10:
+            new_i = int(i) + 10
+            data_str = data_str.replace(i, str(new_i), 1)
+        elif len(i) == 1 and int(i) == 0:
+            new_i = int(i) + 10
+            data_str = data_str.replace(i, str(new_i), 1)
+
+    return data_str.replace("零", "0")
+
+
 @run_safe_model("format_time")
 def format_time(release_time, date_format="%Y-%m-%d %H:%M:%S"):
+    """
+    >>> format_time("2个月前")
+    '2021-08-15 16:24:21'
+    >>> format_time("2月前")
+    '2021-08-15 16:24:36'
+    """
+    release_time = transform_lower_num(release_time)
+    release_time = release_time.replace("日", "天").replace("/", "-")
+
     if "年前" in release_time:
-        years = re.compile("(\d+)年前").findall(release_time)
+        years = re.compile("(\d+)\s*年前").findall(release_time)
         years_ago = datetime.datetime.now() - datetime.timedelta(
             days=int(years[0]) * 365
         )
         release_time = years_ago.strftime("%Y-%m-%d %H:%M:%S")
 
     elif "月前" in release_time:
-        months = re.compile("(\d+)月前").findall(release_time)
+        months = re.compile("(\d+)[\s个]*月前").findall(release_time)
         months_ago = datetime.datetime.now() - datetime.timedelta(
             days=int(months[0]) * 30
         )
         release_time = months_ago.strftime("%Y-%m-%d %H:%M:%S")
 
     elif "周前" in release_time:
-        weeks = re.compile("(\d+)周前").findall(release_time)
+        weeks = re.compile("(\d+)\s*周前").findall(release_time)
         weeks_ago = datetime.datetime.now() - datetime.timedelta(days=int(weeks[0]) * 7)
         release_time = weeks_ago.strftime("%Y-%m-%d %H:%M:%S")
 
     elif "天前" in release_time:
-        ndays = re.compile("(\d+)天前").findall(release_time)
+        ndays = re.compile("(\d+)\s*天前").findall(release_time)
         days_ago = datetime.datetime.now() - datetime.timedelta(days=int(ndays[0]))
         release_time = days_ago.strftime("%Y-%m-%d %H:%M:%S")
 
     elif "小时前" in release_time:
-        nhours = re.compile("(\d+)小时前").findall(release_time)
+        nhours = re.compile("(\d+)\s*小时前").findall(release_time)
         hours_ago = datetime.datetime.now() - datetime.timedelta(hours=int(nhours[0]))
         release_time = hours_ago.strftime("%Y-%m-%d %H:%M:%S")
 
     elif "分钟前" in release_time:
-        nminutes = re.compile("(\d+)分钟前").findall(release_time)
+        nminutes = re.compile("(\d+)\s*分钟前").findall(release_time)
         minutes_ago = datetime.datetime.now() - datetime.timedelta(
             minutes=int(nminutes[0])
         )
         release_time = minutes_ago.strftime("%Y-%m-%d %H:%M:%S")
 
-    elif "昨天" in release_time or "昨日" in release_time:
+    elif "前天" in release_time:
+        today = datetime.date.today()
+        yesterday = today - datetime.timedelta(days=2)
+        release_time = release_time.replace("前天", str(yesterday))
+
+    elif "昨天" in release_time:
         today = datetime.date.today()
         yesterday = today - datetime.timedelta(days=1)
         release_time = release_time.replace("昨天", str(yesterday))
@@ -1559,6 +1824,9 @@ def format_time(release_time, date_format="%Y-%m-%d %H:%M:%S"):
         else:
             release_time = str(int(get_current_date("%Y")) - 1) + "-" + release_time
 
+    # 把日和小时粘在一起的拆开
+    template = re.compile("(\d{4}-\d{1,2}-\d{2})(\d{1,2})")
+    release_time = re.sub(template, r"\1 \2", release_time)
     release_time = format_date(release_time, new_format=date_format)
 
     return release_time
@@ -1661,28 +1929,10 @@ def get_sha1(*args):
     return sha1.hexdigest()  # 40位
 
 
-def get_base64(secret, message):
-    """
-    @summary: 数字证书签名算法是："HMAC-SHA256"
-              参考：https://www.jokecamp.com/blog/examples-of-creating-base64-hashes-using-hmac-sha256-in-different-languages/
-    ---------
-    @param secret: 秘钥
-    @param message: 消息
-    ---------
-    @result: 签名输出类型是："base64"
-    """
-
-    import hashlib
-    import hmac
-    import base64
-
-    message = bytes(message, "utf-8")
-    secret = bytes(secret, "utf-8")
-
-    signature = base64.b64encode(
-        hmac.new(secret, message, digestmod=hashlib.sha256).digest()
-    ).decode("utf8")
-    return signature
+def get_base64(data):
+    if data is None:
+        return data
+    return base64.b64encode(str(data).encode()).decode("utf8")
 
 
 def get_uuid(key1="", key2=""):
@@ -1816,7 +2066,7 @@ def get_method(obj, name):
         return None
 
 
-def witch_workspace(project_path):
+def switch_workspace(project_path):
     """
     @summary:
     ---------
@@ -1884,14 +2134,14 @@ def make_insert_sql(
             ["{key}=values({key})".format(key=key) for key in update_columns]
         )
         sql = (
-            "insert%s into {table} {keys} values {values} on duplicate key update %s"
+            "insert%s into `{table}` {keys} values {values} on duplicate key update %s"
             % (" ignore" if insert_ignore else "", update_columns_)
         )
 
     elif auto_update:
-        sql = "replace into {table} {keys} values {values}"
+        sql = "replace into `{table}` {keys} values {values}"
     else:
-        sql = "insert%s into {table} {keys} values {values}" % (
+        sql = "insert%s into `{table}` {keys} values {values}" % (
             " ignore" if insert_ignore else ""
         )
 
@@ -1914,7 +2164,7 @@ def make_update_sql(table, data, condition):
     for key, value in data.items():
         value = format_sql_value(value)
         if isinstance(value, str):
-            key_values.append("`{}`='{}'".format(key, value))
+            key_values.append("`{}`={}".format(key, repr(value)))
         elif value is None:
             key_values.append("`{}`={}".format(key, "null"))
         else:
@@ -1922,7 +2172,7 @@ def make_update_sql(table, data, condition):
 
     key_values = ", ".join(key_values)
 
-    sql = "update {table} set {key_values} where {condition}"
+    sql = "update `{table}` set {key_values} where {condition}"
     sql = sql.format(table=table, key_values=key_values, condition=condition)
     return sql
 
@@ -1944,7 +2194,7 @@ def make_batch_sql(
     if not datas:
         return
 
-    keys = list(datas[0].keys())
+    keys = list(set([key for data in datas for key in data]))
     values_placeholder = ["%s"] * len(keys)
 
     values = []
@@ -1977,18 +2227,18 @@ def make_batch_sql(
             update_columns_ = ", ".join(
                 ["`{key}`=values(`{key}`)".format(key=key) for key in update_columns]
             )
-        sql = "insert into {table} {keys} values {values_placeholder} on duplicate key update {update_columns}".format(
+        sql = "insert into `{table}` {keys} values {values_placeholder} on duplicate key update {update_columns}".format(
             table=table,
             keys=keys,
             values_placeholder=values_placeholder,
             update_columns=update_columns_,
         )
     elif auto_update:
-        sql = "replace into {table} {keys} values {values_placeholder}".format(
+        sql = "replace into `{table}` {keys} values {values_placeholder}".format(
             table=table, keys=keys, values_placeholder=values_placeholder
         )
     else:
-        sql = "insert ignore into {table} {keys} values {values_placeholder}".format(
+        sql = "insert ignore into `{table}` {keys} values {values_placeholder}".format(
             table=table, keys=keys, values_placeholder=values_placeholder
         )
 
@@ -1998,7 +2248,7 @@ def make_batch_sql(
 ############### json相关 #######################
 
 
-def key2underline(key, strict=True):
+def key2underline(key: str, strict=True):
     """
     >>> key2underline("HelloWord")
     'hello_word'
@@ -2010,15 +2260,17 @@ def key2underline(key, strict=True):
     'sh_data_hi'
     >>> key2underline("SHDataHi", strict=True)
     's_h_data_hi'
+    >>> key2underline("dataHi", strict=True)
+    'data_hi'
     """
     regex = "[A-Z]*" if not strict else "[A-Z]"
     capitals = re.findall(regex, key)
 
     if capitals:
-        for pos, capital in enumerate(capitals):
+        for capital in capitals:
             if not capital:
                 continue
-            if pos == 0:
+            if key.startswith(capital):
                 if len(capital) > 1:
                     key = key.replace(
                         capital, capital[:-1].lower() + "_" + capital[-1].lower(), 1
@@ -2178,45 +2430,102 @@ def re_def_supper_class(obj, supper_class):
 
 
 ###################
+freq_limit_record = {}
 
 
-def is_in_rate_limit(rate_limit, *key):
+def reach_freq_limit(rate_limit, *key):
     """
     频率限制
     :param rate_limit: 限制时间 单位秒
-    :param key: 限制频率的key
+    :param key: 频率限制的key
     :return: True / False
     """
+    if rate_limit == 0:
+        return False
+
     msg_md5 = get_md5(*key)
     key = "rate_limit:{}".format(msg_md5)
-    if get_redisdb().get(key):
-        return True
+    try:
+        if get_redisdb().strget(key):
+            return True
 
-    get_redisdb().set(key, time.time(), ex=rate_limit)
+        get_redisdb().strset(key, time.time(), ex=rate_limit)
+    except redis.exceptions.ConnectionError as e:
+        # 使用内存做频率限制
+        global freq_limit_record
+
+        if key not in freq_limit_record:
+            freq_limit_record[key] = time.time()
+            return False
+
+        if time.time() - freq_limit_record.get(key) < rate_limit:
+            return True
+        else:
+            freq_limit_record[key] = time.time()
+
     return False
 
 
 def dingding_warning(
     message,
+    *,
     message_prefix=None,
-    rate_limit=setting.WARNING_INTERVAL,
-    url=setting.DINGDING_WARNING_URL,
-    user_phone=setting.DINGDING_WARNING_PHONE,
+    rate_limit=None,
+    url=None,
+    user_phone=None,
+    user_id=None,
+    secret=None,
 ):
-    if not all([url, user_phone, message]):
+    """
+    钉钉报警，user_phone与user_id 二选一即可
+    Args:
+        message:
+        message_prefix: 消息摘要，用于去重
+        rate_limit: 包名频率，单位秒，相同的报警内容在rate_limit时间内只会报警一次
+        url: 钉钉报警url
+        user_phone: 被@的群成员手机号，支持列表，可指定多个。
+        user_id: 被@的群成员userId，支持列表，可指定多个
+        secret: 钉钉报警加签密钥
+    Returns:
+
+    """
+    # 为了加载最新的配置
+    rate_limit = rate_limit if rate_limit is not None else setting.WARNING_INTERVAL
+    url = url or setting.DINGDING_WARNING_URL
+    user_phone = user_phone or setting.DINGDING_WARNING_PHONE
+    user_id = user_id or setting.DINGDING_WARNING_USER_ID
+    secret = secret or setting.DINGDING_WARNING_SECRET
+    if secret:
+        timestamp = str(round(time.time() * 1000))
+        secret_enc = secret.encode("utf-8")
+        string_to_sign_enc = f"{timestamp}\n{secret}".encode("utf-8")
+        hmac_code = hmac.new(
+            secret_enc, string_to_sign_enc, digestmod=hashlib.sha256
+        ).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
+        url = f"{url}&timestamp={timestamp}&sign={sign}"
+
+    if not all([url, message]):
         return
 
-    if is_in_rate_limit(rate_limit, url, user_phone, message_prefix or message):
+    if reach_freq_limit(rate_limit, url, user_phone, message_prefix or message):
         log.info("报警时间间隔过短，此次报警忽略。 内容 {}".format(message))
         return
 
     if isinstance(user_phone, str):
-        user_phone = [user_phone]
+        user_phone = [user_phone] if user_phone else []
+
+    if isinstance(user_id, str):
+        user_id = [user_id] if user_id else []
 
     data = {
         "msgtype": "text",
         "text": {"content": message},
-        "at": {"atMobiles": user_phone, "isAtAll": False},
+        "at": {
+            "atMobiles": user_phone,
+            "atUserIds": user_id,
+            "isAtAll": setting.DINGDING_WARNING_ALL,
+        },
     }
 
     headers = {"Content-Type": "application/json"}
@@ -2240,16 +2549,24 @@ def email_warning(
     message,
     title,
     message_prefix=None,
-    eamil_sender=setting.EAMIL_SENDER,
-    eamil_password=setting.EAMIL_PASSWORD,
-    email_receiver=setting.EMAIL_RECEIVER,
-    rate_limit=setting.WARNING_INTERVAL,
+    email_sender=None,
+    email_password=None,
+    email_receiver=None,
+    email_smtpserver=None,
+    rate_limit=None,
 ):
-    if not all([message, eamil_sender, eamil_password, email_receiver]):
+    # 为了加载最新的配置
+    email_sender = email_sender or setting.EMAIL_SENDER
+    email_password = email_password or setting.EMAIL_PASSWORD
+    email_receiver = email_receiver or setting.EMAIL_RECEIVER
+    email_smtpserver = email_smtpserver or setting.EMAIL_SMTPSERVER
+    rate_limit = rate_limit if rate_limit is not None else setting.WARNING_INTERVAL
+
+    if not all([message, email_sender, email_password, email_receiver]):
         return
 
-    if is_in_rate_limit(
-        rate_limit, email_receiver, eamil_sender, message_prefix or message
+    if reach_freq_limit(
+        rate_limit, email_receiver, email_sender, message_prefix or message
     ):
         log.info("报警时间间隔过短，此次报警忽略。 内容 {}".format(message))
         return
@@ -2257,7 +2574,9 @@ def email_warning(
     if isinstance(email_receiver, str):
         email_receiver = [email_receiver]
 
-    with EmailSender(username=eamil_sender, password=eamil_password) as email:
+    with EmailSender(
+        username=email_sender, password=email_password, smtpserver=email_smtpserver
+    ) as email:
         return email.send(receivers=email_receiver, title=title, content=message)
 
 
@@ -2277,7 +2596,7 @@ def linkedsee_warning(message, rate_limit=3600, message_prefix=None, token=None)
         log.info("未设置灵犀token，不支持报警")
         return
 
-    if is_in_rate_limit(rate_limit, token, message_prefix or message):
+    if reach_freq_limit(rate_limit, token, message_prefix or message):
         log.info("报警时间间隔过短，此次报警忽略。 内容 {}".format(message))
         return
 
@@ -2288,3 +2607,219 @@ def linkedsee_warning(message, rate_limit=3600, message_prefix=None, token=None)
     data = {"content": message}
     response = requests.post(url, data=json.dumps(data), headers=headers)
     return response
+
+
+def wechat_warning(
+    message,
+    message_prefix=None,
+    rate_limit=None,
+    url=None,
+    user_phone=None,
+    all_users: bool = None,
+):
+    """企业微信报警"""
+
+    # 为了加载最新的配置
+    rate_limit = rate_limit if rate_limit is not None else setting.WARNING_INTERVAL
+    url = url or setting.WECHAT_WARNING_URL
+    user_phone = user_phone or setting.WECHAT_WARNING_PHONE
+    all_users = all_users if all_users is not None else setting.WECHAT_WARNING_ALL
+
+    if isinstance(user_phone, str):
+        user_phone = [user_phone] if user_phone else []
+
+    if all_users is True or not user_phone:
+        user_phone = ["@all"]
+
+    if not all([url, message]):
+        return
+
+    if reach_freq_limit(rate_limit, url, user_phone, message_prefix or message):
+        log.info("报警时间间隔过短，此次报警忽略。 内容 {}".format(message))
+        return
+
+    data = {
+        "msgtype": "text",
+        "text": {"content": message, "mentioned_mobile_list": user_phone},
+    }
+
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        response = requests.post(
+            url, headers=headers, data=json.dumps(data).encode("utf8")
+        )
+        result = response.json()
+        response.close()
+        if result.get("errcode") == 0:
+            return True
+        else:
+            raise Exception(result.get("errmsg"))
+    except Exception as e:
+        log.error("报警发送失败。 报警内容 {}, error: {}".format(message, e))
+        return False
+
+
+def feishu_warning(message, message_prefix=None, rate_limit=None, url=None, user=None):
+    """
+
+    Args:
+        message:
+        message_prefix:
+        rate_limit:
+        url:
+        user: {"open_id":"ou_xxxxx", "name":"xxxx"} 或 [{"open_id":"ou_xxxxx", "name":"xxxx"}]
+
+    Returns:
+
+    """
+    # 为了加载最新的配置
+    rate_limit = rate_limit if rate_limit is not None else setting.WARNING_INTERVAL
+    url = url or setting.FEISHU_WARNING_URL
+    user = user or setting.FEISHU_WARNING_USER
+
+    if not all([url, message]):
+        return
+
+    if reach_freq_limit(rate_limit, url, user, message_prefix or message):
+        log.info("报警时间间隔过短，此次报警忽略。 内容 {}".format(message))
+        return
+
+    if isinstance(user, dict):
+        user = [user] if user else []
+
+    at = ""
+    if setting.FEISHU_WARNING_ALL:
+        at = '<at user_id="all">所有人</at>'
+    elif user:
+        at = " ".join(
+            [f'<at user_id="{u.get("open_id")}">{u.get("name")}</at>' for u in user]
+        )
+
+    data = {"msg_type": "text", "content": {"text": at + message}}
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        response = requests.post(
+            url, headers=headers, data=json.dumps(data).encode("utf8")
+        )
+        result = response.json()
+        response.close()
+        if result.get("StatusCode") == 0:
+            return True
+        else:
+            raise Exception(result.get("msg"))
+    except Exception as e:
+        log.error("报警发送失败。 报警内容 {}, error: {}".format(message, e))
+        return False
+
+
+def send_msg(msg, level="DEBUG", message_prefix=""):
+    if setting.WARNING_LEVEL == "ERROR":
+        if level.upper() != "ERROR":
+            return
+
+    if setting.DINGDING_WARNING_URL:
+        keyword = "feapder报警系统\n"
+        dingding_warning(keyword + msg, message_prefix=message_prefix)
+
+    if setting.EMAIL_RECEIVER:
+        title = message_prefix or msg
+        if len(title) > 50:
+            title = title[:50] + "..."
+        email_warning(msg, message_prefix=message_prefix, title=title)
+
+    if setting.WECHAT_WARNING_URL:
+        keyword = "feapder报警系统\n"
+        wechat_warning(keyword + msg, message_prefix=message_prefix)
+
+    if setting.FEISHU_WARNING_URL:
+        keyword = "feapder报警系统\n"
+        feishu_warning(keyword + msg, message_prefix=message_prefix)
+
+
+###################
+
+
+def make_item(cls, data: dict):
+    """提供Item类与原数据，快速构建Item实例
+    :param cls: Item类
+    :param data: 字典格式的数据
+    """
+    item = cls()
+    for key, val in data.items():
+        setattr(item, key, val)
+    return item
+
+
+###################
+
+
+def aio_wrap(loop=None, executor=None):
+    """
+    wrap a normal sync version of a function to an async version
+    """
+    outer_loop = loop
+    outer_executor = executor
+
+    def wrap(fn):
+        @wraps(fn)
+        async def run(*args, loop=None, executor=None, **kwargs):
+            if loop is None:
+                if outer_loop is None:
+                    loop = asyncio.get_event_loop()
+                else:
+                    loop = outer_loop
+            if executor is None:
+                executor = outer_executor
+            pfunc = partial(fn, *args, **kwargs)
+            return await loop.run_in_executor(executor, pfunc)
+
+        return run
+
+    return wrap
+
+
+######### number ##########
+
+
+def ensure_int(n):
+    """
+    >>> ensure_int(None)
+    0
+    >>> ensure_int(False)
+    0
+    >>> ensure_int(12)
+    12
+    >>> ensure_int("72")
+    72
+    >>> ensure_int('')
+    0
+    >>> ensure_int('1')
+    1
+    """
+    if not n:
+        return 0
+    return int(n)
+
+
+def ensure_float(n):
+    """
+    >>> ensure_float(None)
+    0.0
+    >>> ensure_float(False)
+    0.0
+    >>> ensure_float(12)
+    12.0
+    >>> ensure_float("72")
+    72.0
+    """
+    if not n:
+        return 0.0
+    return float(n)
+
+
+def import_cls(cls_info):
+    module, class_name = cls_info.rsplit(".", 1)
+    cls = importlib.import_module(module).__getattribute__(class_name)
+    return cls

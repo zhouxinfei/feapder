@@ -14,17 +14,15 @@ from feapder.network.request import Request
 from feapder.utils.log import log
 
 
-class HandleFailedRequests(object):
-    """docstring for HandleFailedRequests"""
-
+class HandleFailedRequests:
     def __init__(self, redis_key):
-        super(HandleFailedRequests, self).__init__()
-        self._redis_key = redis_key
+        if redis_key.endswith(":z_failed_requests"):
+            redis_key = redis_key.replace(":z_failed_requests", "")
 
         self._redisdb = RedisDB()
-        self._request_buffer = RequestBuffer(self._redis_key)
+        self._request_buffer = RequestBuffer(redis_key)
 
-        self._table_failed_request = setting.TAB_FAILED_REQUSETS.format(
+        self._table_failed_request = setting.TAB_FAILED_REQUESTS.format(
             redis_key=redis_key
         )
 
@@ -37,16 +35,19 @@ class HandleFailedRequests(object):
         log.debug("正在重置失败的requests...")
         total_count = 0
         while True:
-            failed_requests = self.get_failed_requests()
-            if not failed_requests:
-                break
+            try:
+                failed_requests = self.get_failed_requests()
+                if not failed_requests:
+                    break
 
-            for request in failed_requests:
-                request["retry_times"] = 0
-                request_obj = Request.from_dict(request)
-                self._request_buffer.put_request(request_obj)
+                for request in failed_requests:
+                    request["retry_times"] = 0
+                    request_obj = Request.from_dict(request)
+                    self._request_buffer.put_request(request_obj)
 
-                total_count += 1
+                    total_count += 1
+            except Exception as e:
+                log.exception(e)
 
         self._request_buffer.flush()
 

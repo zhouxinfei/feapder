@@ -5,19 +5,17 @@ Created on 2020/4/22 12:06 AM
 @summary:
 ---------
 @author: Boris
-@email: boris@bzkj.tech
+@email: boris_liu@foxmail.com
 """
 
 import datetime
 import os
 import time
 import warnings
-from collections import Iterable
+from collections.abc import Iterable
 
 import feapder.setting as setting
 import feapder.utils.tools as tools
-from feapder.buffer.item_buffer import MAX_ITEM_COUNT
-from feapder.buffer.request_buffer import RequestBuffer
 from feapder.core.base_parser import BatchParser
 from feapder.core.scheduler import Scheduler
 from feapder.db.mysqldb import MysqlDB
@@ -30,7 +28,6 @@ from feapder.utils.perfect_dict import PerfectDict
 from feapder.utils.redis_lock import RedisLock
 
 CONSOLE_PIPELINE_PATH = "feapder.pipelines.console_pipeline.ConsolePipeline"
-MYSQL_PIPELINE_PATH = "feapder.pipelines.mysql_pipeline.MysqlPipeline"
 
 
 class BatchSpider(BatchParser, Scheduler):
@@ -54,8 +51,9 @@ class BatchSpider(BatchParser, Scheduler):
         begin_callback=None,
         end_callback=None,
         delete_keys=(),
-        auto_stop_when_spider_done=None,
-        send_run_time=False,
+        keep_alive=None,
+        auto_start_next_batch=True,
+        **kwargs,
     ):
         """
         @summary: 批次爬虫
@@ -89,8 +87,8 @@ class BatchSpider(BatchParser, Scheduler):
         @param begin_callback: 爬虫开始回调函数
         @param end_callback: 爬虫结束回调函数
         @param delete_keys: 爬虫启动时删除的key，类型: 元组/bool/string。 支持正则; 常用于清空任务队列，否则重启时会断点续爬
-        @param auto_stop_when_spider_done: 爬虫抓取完毕后是否自动结束或等待任务，默认自动结束
-        @param send_run_time: 发送运行时间
+        @param keep_alive: 爬虫是否常驻，默认否
+        @param auto_start_next_batch: 本批次结束后，且下一批次时间已到达时，是否自动启动下一批次，默认是
         @param related_redis_key: 有关联的其他爬虫任务表（redis）注意：要避免环路 如 A -> B & B -> A 。
         @param related_batch_record: 有关联的其他爬虫批次表（mysql）注意：要避免环路 如 A -> B & B -> A 。
             related_redis_key 与 related_batch_record 选其一配置即可；用于相关联的爬虫没结束时，本爬虫也不结束
@@ -108,17 +106,15 @@ class BatchSpider(BatchParser, Scheduler):
             begin_callback=begin_callback,
             end_callback=end_callback,
             delete_keys=delete_keys,
-            auto_stop_when_spider_done=auto_stop_when_spider_done,
+            keep_alive=keep_alive,
             auto_start_requests=False,
-            send_run_time=send_run_time,
             batch_interval=batch_interval,
             task_table=task_table,
+            **kwargs,
         )
 
         self._redisdb = RedisDB()
         self._mysqldb = MysqlDB()
-
-        self._request_buffer = RequestBuffer(self._redis_key)
 
         self._task_table = task_table  # mysql中的任务表
         self._batch_record_table = batch_record_table  # mysql 中的批次记录表
@@ -130,11 +126,11 @@ class BatchSpider(BatchParser, Scheduler):
         self._check_task_interval = check_task_interval
         self._task_limit = task_limit  # mysql中一次取的任务数量
         self._related_task_tables = [
-            setting.TAB_REQUSETS.format(redis_key=redis_key)
+            setting.TAB_REQUESTS.format(redis_key=redis_key)
         ]  # 自己的task表也需要检查是否有任务
         if related_redis_key:
             self._related_task_tables.append(
-                setting.TAB_REQUSETS.format(redis_key=related_redis_key)
+                setting.TAB_REQUESTS.format(redis_key=related_redis_key)
             )
 
         self._related_batch_record = related_batch_record
@@ -146,6 +142,7 @@ class BatchSpider(BatchParser, Scheduler):
             task_condition
         )
         self._task_order_by = task_order_by and " order by {}".format(task_order_by)
+        self._auto_start_next_batch = auto_start_next_batch
 
         self._batch_date_cache = None
         if self._batch_interval >= 1:
@@ -155,33 +152,35 @@ class BatchSpider(BatchParser, Scheduler):
         else:
             self._date_format = "%Y-%m-%d %H:%M"
 
-        # 报警相关
-        self._send_msg_interval = datetime.timedelta(hours=1)  # 每隔1小时发送一次报警
-        self._last_send_msg_time = None
-
-        self._spider_last_done_time = None  # 爬虫最近已做任务数量时间
-        self._spider_last_done_count = 0  # 爬虫最近已做任务数量
-        self._spider_deal_speed_cached = None
-
         self._is_more_parsers = True  # 多模版类爬虫
 
-    def init_property(self):
+        # 初始化每个配置的属性
+        self._spider_last_done_time = None  # 爬虫最近已做任务数量时间
+        self._spider_last_done_count = None  # 爬虫最近已做任务数量
+        self._spider_deal_speed_cached = None
+        self._batch_timeout = False  # 批次是否超时或将要超时
+
+        # 重置任务
+        self.reset_task()
+
+    def init_batch_property(self):
         """
         每个批次开始时需要重置的属性
         @return:
         """
-        self._last_send_msg_time = None
-
+        self._spider_deal_speed_cached = None
         self._spider_last_done_time = None
-        self._spider_last_done_count = 0  # 爬虫刚开始启动时已做任务数量
+        self._spider_last_done_count = None  # 爬虫刚开始启动时已做任务数量
+        self._batch_timeout = False
 
-    def add_parser(self, parser):
+    def add_parser(self, parser, **kwargs):
         parser = parser(
             self._task_table,
             self._batch_record_table,
             self._task_state,
             self._date_format,
             self._mysqldb,
+            **kwargs,
         )  # parser 实例化
         self._parsers.append(parser)
 
@@ -209,7 +208,7 @@ class BatchSpider(BatchParser, Scheduler):
         while True:
             try:
                 if self.check_batch(is_first_check):  # 该批次已经做完
-                    if not self._auto_stop_when_spider_done:
+                    if self._keep_alive:
                         is_first_check = True
                         log.info("爬虫所有任务已做完，不自动结束，等待新任务...")
                         time.sleep(self._check_task_interval)
@@ -220,7 +219,7 @@ class BatchSpider(BatchParser, Scheduler):
                 is_first_check = False
 
                 # 检查redis中是否有任务 任务小于_min_task_count 则从mysql中取
-                tab_requests = setting.TAB_REQUSETS.format(redis_key=self._redis_key)
+                tab_requests = setting.TAB_REQUESTS.format(redis_key=self._redis_key)
                 todo_task_count = self._redisdb.zget_count(tab_requests)
 
                 tasks = []
@@ -309,7 +308,7 @@ class BatchSpider(BatchParser, Scheduler):
                     ) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8;
             """.format(
                 table_name=self._batch_record_table,
-                batch_date="date" if self._date_format == "%Y-%m-%d" else "datetime",
+                batch_date="datetime",
             )
 
             self._mysqldb.execute(sql)
@@ -348,7 +347,7 @@ class BatchSpider(BatchParser, Scheduler):
 
                                 if (
                                     self._item_buffer.get_items_count()
-                                    >= MAX_ITEM_COUNT
+                                    >= setting.ITEM_MAX_CACHED_COUNT
                                 ):
                                     self._item_buffer.flush()
 
@@ -360,7 +359,7 @@ class BatchSpider(BatchParser, Scheduler):
 
                                     if (
                                         self._item_buffer.get_items_count()
-                                        >= MAX_ITEM_COUNT
+                                        >= setting.ITEM_MAX_CACHED_COUNT
                                     ):
                                         self._item_buffer.flush()
 
@@ -396,7 +395,10 @@ class BatchSpider(BatchParser, Scheduler):
                             self._item_buffer.put_item(request)
                             result_type = 2
 
-                            if self._item_buffer.get_items_count() >= MAX_ITEM_COUNT:
+                            if (
+                                self._item_buffer.get_items_count()
+                                >= setting.ITEM_MAX_CACHED_COUNT
+                            ):
                                 self._item_buffer.flush()
 
                         elif callable(request):  # callbale的request可能是更新数据库操作的函数
@@ -407,7 +409,7 @@ class BatchSpider(BatchParser, Scheduler):
 
                                 if (
                                     self._item_buffer.get_items_count()
-                                    >= MAX_ITEM_COUNT
+                                    >= setting.ITEM_MAX_CACHED_COUNT
                                 ):
                                     self._item_buffer.flush()
 
@@ -474,8 +476,9 @@ class BatchSpider(BatchParser, Scheduler):
         """
         # TODO 分批取数据 每批最大取 1000000个，防止内存占用过大
         # 查询任务
+        task_keys = ", ".join([f"`{key}`" for key in self._task_keys])
         sql = "select %s from %s where %s = 0%s%s limit %s" % (
-            ", ".join(self._task_keys),
+            task_keys,
             self._task_table,
             self._task_state,
             self._task_condition_prefix_and,
@@ -508,8 +511,9 @@ class BatchSpider(BatchParser, Scheduler):
         """
 
         # 查询任务
+        task_keys = ", ".join([f"`{key}`" for key in self._task_keys])
         sql = "select %s from %s where %s = 2%s%s limit %s" % (
-            ", ".join(self._task_keys),
+            task_keys,
             self._task_table,
             self._task_state,
             self._task_condition_prefix_and,
@@ -555,14 +559,12 @@ class BatchSpider(BatchParser, Scheduler):
             或
             None
         """
-        if not self._spider_last_done_count:
-            now_date = datetime.datetime.now()
+        now_date = datetime.datetime.now()
+        if self._spider_last_done_count is None:
             self._spider_last_done_count = done_count
             self._spider_last_done_time = now_date
 
-        if done_count > self._spider_last_done_count:
-            now_date = datetime.datetime.now()
-
+        elif done_count > self._spider_last_done_count:
             time_interval = (now_date - self._spider_last_done_time).total_seconds()
             deal_speed = (
                 done_count - self._spider_last_done_count
@@ -614,14 +616,14 @@ class BatchSpider(BatchParser, Scheduler):
         @result: 完成返回True 否则False
         """
 
-        sql = 'select date_format(batch_date, "{date_format}"), total_count, done_count from {batch_record_table} order by id desc limit 1'.format(
+        sql = 'select date_format(batch_date, "{date_format}"), total_count, done_count, is_done from {batch_record_table} order by id desc limit 1'.format(
             date_format=self._date_format.replace(":%M", ":%i"),
             batch_record_table=self._batch_record_table,
         )
-        batch_info = self._mysqldb.find(sql)  # (('2018-08-19', 49686, 0),)
+        batch_info = self._mysqldb.find(sql)  # (('批次时间', 总量, 完成量, 批次是否完成),)
 
         if batch_info:
-            batch_date, total_count, done_count = batch_info[0]
+            batch_date, total_count, done_count, is_done = batch_info[0]
 
             now_date = datetime.datetime.now()
             last_batch_date = datetime.datetime.strptime(batch_date, self._date_format)
@@ -637,47 +639,54 @@ class BatchSpider(BatchParser, Scheduler):
                 done_count = task_count.get("done_count")
 
             if total_count == done_count:
-                # 检查相关联的爬虫是否完成
-                releated_spider_is_done = self.related_spider_is_done()
-                if releated_spider_is_done == False:
-                    msg = "《{}》本批次未完成, 正在等待依赖爬虫 {} 结束. 批次时间 {} 批次进度 {}/{}".format(
-                        self._batch_name,
-                        self._related_batch_record or self._related_task_tables,
-                        batch_date,
-                        done_count,
-                        total_count,
-                    )
-                    log.info(msg)
-                    # 检查是否超时 超时发出报警
-                    if time_difference >= datetime.timedelta(
-                        days=self._batch_interval
-                    ):  # 已经超时
-                        if (
-                            not self._last_send_msg_time
-                            or now_date - self._last_send_msg_time
-                            >= self._send_msg_interval
-                        ):
-                            self._last_send_msg_time = now_date
-                            self.send_msg(msg, level="error")
+                if not is_done:
+                    # 检查相关联的爬虫是否完成
+                    related_spider_is_done = self.related_spider_is_done()
+                    if related_spider_is_done is False:
+                        msg = "《{}》本批次未完成, 正在等待依赖爬虫 {} 结束. 批次时间 {} 批次进度 {}/{}".format(
+                            self._batch_name,
+                            self._related_batch_record or self._related_task_tables,
+                            batch_date,
+                            done_count,
+                            total_count,
+                        )
+                        log.info(msg)
+                        # 检查是否超时 超时发出报警
+                        if time_difference >= datetime.timedelta(
+                            days=self._batch_interval
+                        ):  # 已经超时
+                            self.send_msg(
+                                msg,
+                                level="error",
+                                message_prefix="《{}》本批次未完成, 正在等待依赖爬虫 {} 结束".format(
+                                    self._batch_name,
+                                    self._related_batch_record
+                                    or self._related_task_tables,
+                                ),
+                            )
+                            self._batch_timeout = True
 
-                    return False
+                        return False
 
-                elif releated_spider_is_done == True:
-                    # 更新is_done 状态
-                    self.update_is_done()
-
-                else:
-                    self.update_is_done()
+                    else:
+                        self.update_is_done()
 
                 msg = "《{}》本批次完成 批次时间 {} 共处理 {} 条任务".format(
                     self._batch_name, batch_date, done_count
                 )
                 log.info(msg)
                 if not is_first_check:
-                    self.send_msg(msg)
+                    if self._batch_timeout:  # 之前报警过已超时，现在已完成，发出恢复消息
+                        self._batch_timeout = False
+                        self.send_msg(msg, level="error")
+                    else:
+                        self.send_msg(msg)
 
                 # 判断下一批次是否到
                 if time_difference >= datetime.timedelta(days=self._batch_interval):
+                    if not is_first_check and not self._auto_start_next_batch:
+                        return True  # 下一批次不开始。因为设置了不自动开始下一批次
+
                     msg = "《{}》下一批次开始".format(self._batch_name)
                     log.info(msg)
                     self.send_msg(msg)
@@ -685,14 +694,20 @@ class BatchSpider(BatchParser, Scheduler):
                     # 初始化任务表状态
                     if self.init_task() != False:  # 更新失败返回False 其他返回True/None
                         # 初始化属性
-                        self.init_property()
+                        self.init_batch_property()
 
                         is_success = (
                             self.record_batch()
                         )  # 有可能插入不成功，但是任务表已经重置了，不过由于当前时间为下一批次的时间，检查批次是否结束时不会检查任务表，所以下次执行时仍然会重置
                         if is_success:
-                            log.info("插入新批次记录成功 1分钟后开始下发任务")  # 防止work批次时间没来得及更新
-                            tools.delay_time(60)
+                            # 看是否有等待任务的worker，若有则需要等会再下发任务，防止work批次时间没来得及更新
+                            if self.have_alive_spider():
+                                log.info(
+                                    f"插入新批次记录成功，检测到有爬虫进程在等待任务，本批任务1分钟后开始下发, 防止爬虫端缓存的批次时间没来得及更新"
+                                )
+                                tools.delay_time(60)
+                            else:
+                                log.info("插入新批次记录成功")
 
                             return False  # 下一批次开始
 
@@ -732,9 +747,12 @@ class BatchSpider(BatchParser, Scheduler):
                         last_batch_date=last_batch_date,
                     )
                     if result:
-                        deal_speed, need_time, overflow_time, calculate_speed_time = (
-                            result
-                        )
+                        (
+                            deal_speed,
+                            need_time,
+                            overflow_time,
+                            calculate_speed_time,
+                        ) = result
                         msg += ", 任务处理速度于{}统计, 约 {}条/小时, 预计还需 {}".format(
                             calculate_speed_time,
                             deal_speed,
@@ -747,14 +765,12 @@ class BatchSpider(BatchParser, Scheduler):
                             )
 
                     log.info(msg)
-
-                    if (
-                        not self._last_send_msg_time
-                        or now_date - self._last_send_msg_time
-                        >= self._send_msg_interval
-                    ):
-                        self._last_send_msg_time = now_date
-                        self.send_msg(msg, level="error")
+                    self.send_msg(
+                        msg,
+                        level="error",
+                        message_prefix="《{}》批次超时".format(self._batch_name),
+                    )
+                    self._batch_timeout = True
 
                 else:  # 未超时
                     remaining_time = (
@@ -789,9 +805,12 @@ class BatchSpider(BatchParser, Scheduler):
                         last_batch_date=last_batch_date,
                     )
                     if result:
-                        deal_speed, need_time, overflow_time, calculate_speed_time = (
-                            result
-                        )
+                        (
+                            deal_speed,
+                            need_time,
+                            overflow_time,
+                            calculate_speed_time,
+                        ) = result
                         msg += ", 任务处理速度于{}统计, 约 {}条/小时, 预计还需 {}".format(
                             calculate_speed_time,
                             deal_speed,
@@ -803,13 +822,12 @@ class BatchSpider(BatchParser, Scheduler):
                                 tools.format_seconds(overflow_time)
                             )
                             # 发送警报
-                            if (
-                                not self._last_send_msg_time
-                                or now_date - self._last_send_msg_time
-                                >= self._send_msg_interval
-                            ):
-                                self._last_send_msg_time = now_date
-                                self.send_msg(msg, level="error")
+                            self.send_msg(
+                                msg,
+                                level="error",
+                                message_prefix="《{}》批次可能超时".format(self._batch_name),
+                            )
+                            self._batch_timeout = True
 
                         elif overflow_time < 0:
                             msg += ", 该批次预计提前 {} 完成".format(
@@ -846,7 +864,7 @@ class BatchSpider(BatchParser, Scheduler):
 
             if is_done is None:
                 log.warning("相关联的批次表不存在或无批次信息")
-                return None
+                return True
 
             if not is_done:
                 return False
@@ -870,18 +888,15 @@ class BatchSpider(BatchParser, Scheduler):
 
         batch_date = tools.get_current_date(self._date_format)
 
-        sql = (
-            "insert into %s (batch_date, done_count, total_count, `interval`, interval_unit, create_time) values ('%s', %s, %s, %s, '%s', CURRENT_TIME)"
-            % (
-                self._batch_record_table,
-                batch_date,
-                0,
-                total_task_count,
-                self._batch_interval
-                if self._batch_interval >= 1
-                else self._batch_interval * 24,
-                "day" if self._batch_interval >= 1 else "hour",
-            )
+        sql = "insert into %s (batch_date, done_count, total_count, `interval`, interval_unit, create_time) values ('%s', %s, %s, %s, '%s', CURRENT_TIME)" % (
+            self._batch_record_table,
+            batch_date,
+            0,
+            total_task_count,
+            self._batch_interval
+            if self._batch_interval >= 1
+            else self._batch_interval * 24,
+            "day" if self._batch_interval >= 1 else "hour",
         )
 
         affect_count = self._mysqldb.add(sql)  # None / 0 / 1 (1 为成功)
@@ -893,13 +908,6 @@ class BatchSpider(BatchParser, Scheduler):
 
             # 爬虫开始
             self.spider_begin()
-            self.record_spider_state(
-                spider_type=2,
-                state=0,
-                batch_date=batch_date,
-                spider_start_time=tools.get_current_date(),
-                batch_interval=self._batch_interval,
-            )
         else:
             log.error("插入新批次失败")
 
@@ -946,12 +954,7 @@ class BatchSpider(BatchParser, Scheduler):
 
         if is_done:  # 检查任务表中是否有没做的任务 若有则is_done 为 False
             # 比较耗时 加锁防止多进程同时查询
-            with RedisLock(
-                key=self._spider_name,
-                timeout=3600,
-                wait_timeout=0,
-                redis_cli=RedisDB().get_redis_obj(),
-            ) as lock:
+            with RedisLock(key=self._spider_name) as lock:
                 if lock.locked:
                     log.info("批次表标记已完成，正在检查任务表是否有未完成的任务")
 
@@ -998,34 +1001,33 @@ class BatchSpider(BatchParser, Scheduler):
             self._start()
 
             while True:
-                if (
-                    self.task_is_done() and self.all_thread_is_done()
-                ):  # redis全部的任务已经做完 并且mysql中的任务已经做完（检查各个线程all_thread_is_done，防止任务没做完，就更新任务状态，导致程序结束的情况）
-                    if not self._is_notify_end:
-                        self.spider_end()
-                        self.record_spider_state(
-                            spider_type=2,
-                            state=1,
-                            batch_date=self._batch_date_cache,
-                            spider_end_time=tools.get_current_date(),
-                            batch_interval=self._batch_interval,
-                        )
+                try:
+                    if self._stop_spider or (
+                        self.task_is_done() and self.all_thread_is_done()
+                    ):  # redis全部的任务已经做完 并且mysql中的任务已经做完（检查各个线程all_thread_is_done，防止任务没做完，就更新任务状态，导致程序结束的情况）
+                        if not self._is_notify_end:
+                            self.spider_end()
+                            self._is_notify_end = True
 
-                        self._is_notify_end = True
+                        if not self._keep_alive:
+                            self._stop_all_thread()
+                            break
+                    else:
+                        self._is_notify_end = False
 
-                    if self._auto_stop_when_spider_done:
-                        self._stop_all_thread()
-                        break
-                else:
-                    self._is_notify_end = False
+                    self.check_task_status()
 
-                self.check_task_status()
+                except Exception as e:
+                    log.exception(e)
+
                 tools.delay_time(10)  # 10秒钟检查一次爬虫状态
 
         except Exception as e:
             msg = "《%s》主线程异常 爬虫结束 exception: %s" % (self._batch_name, e)
             log.error(msg)
-            self.send_msg(msg, level="error")
+            self.send_msg(
+                msg, level="error", message_prefix="《%s》爬虫异常结束".format(self._batch_name)
+            )
 
             os._exit(137)  # 使退出码为35072 方便爬虫管理器重启
 
@@ -1043,14 +1045,12 @@ class DebugBatchSpider(BatchSpider):
     """
 
     __debug_custom_setting__ = dict(
-        COLLECTOR_SLEEP_TIME=1,
         COLLECTOR_TASK_COUNT=1,
         # SPIDER
         SPIDER_THREAD_COUNT=1,
         SPIDER_SLEEP_TIME=0,
-        SPIDER_TASK_COUNT=1,
         SPIDER_MAX_RETRY_TIMES=10,
-        REQUEST_TIME_OUT=600,  # 10分钟
+        REQUEST_LOST_TIMEOUT=600,  # 10分钟
         PROXY_ENABLE=False,
         RETRY_FAILED_REQUESTS=False,
         # 保存失败的request
@@ -1060,7 +1060,6 @@ class DebugBatchSpider(BatchSpider):
         REQUEST_FILTER_ENABLE=False,
         OSS_UPLOAD_TABLES=(),
         DELETE_KEYS=True,
-        ITEM_PIPELINES=[CONSOLE_PIPELINE_PATH],
     )
 
     def __init__(
@@ -1068,15 +1067,15 @@ class DebugBatchSpider(BatchSpider):
         task_id=None,
         task=None,
         save_to_db=False,
-        update_stask=False,
+        update_task=False,
         *args,
-        **kwargs
+        **kwargs,
     ):
         """
         @param task_id:  任务id
         @param task:  任务  task 与 task_id 二者选一即可
         @param save_to_db: 数据是否入库 默认否
-        @param update_stask: 是否更新任务 默认否
+        @param update_task: 是否更新任务 默认否
         @param args:
         @param kwargs:
         """
@@ -1088,10 +1087,11 @@ class DebugBatchSpider(BatchSpider):
             raise Exception("task_id 与 task 不能同时为null")
 
         kwargs["redis_key"] = kwargs["redis_key"] + "_debug"
-        if save_to_db and not self.__class__.__custom_setting__.get("ITEM_PIPELINES"):
-            self.__class__.__debug_custom_setting__.update(
-                ITEM_PIPELINES=[MYSQL_PIPELINE_PATH]
-            )
+        if not save_to_db:
+            self.__class__.__debug_custom_setting__["ITEM_PIPELINES"] = [
+                CONSOLE_PIPELINE_PATH
+            ]
+
         self.__class__.__custom_setting__.update(
             self.__class__.__debug_custom_setting__
         )
@@ -1100,7 +1100,7 @@ class DebugBatchSpider(BatchSpider):
 
         self._task_id = task_id
         self._task = task
-        self._update_task = update_stask
+        self._update_task = update_task
 
     def start_monitor_task(self):
         """
@@ -1136,8 +1136,9 @@ class DebugBatchSpider(BatchSpider):
         """
 
         # 查询任务
+        task_keys = ", ".join([f"`{key}`" for key in self._task_keys])
         sql = "select %s from %s where id=%s" % (
-            ", ".join(self._task_keys),
+            task_keys,
             self._task_table,
             self._task_id,
         )
@@ -1192,22 +1193,6 @@ class DebugBatchSpider(BatchSpider):
 
             return update_item
 
-    def delete_tables(self, delete_tables_list):
-        if isinstance(delete_tables_list, bool):
-            delete_tables_list = [self._redis_key + "*"]
-        elif not isinstance(delete_tables_list, (list, tuple)):
-            delete_tables_list = [delete_tables_list]
-
-        redis = RedisDB()
-        for delete_tab in delete_tables_list:
-            if delete_tab == "*":
-                delete_tab = self._redis_key + "*"
-
-            tables = redis.getkeys(delete_tab)
-            for table in tables:
-                log.info("正在删除表 %s" % table)
-                redis.clear(table)
-
     def run(self):
         self.start_monitor_task()
 
@@ -1217,21 +1202,14 @@ class DebugBatchSpider(BatchSpider):
         self._start()
 
         while True:
-            if self.all_thread_is_done():
-                self._stop_all_thread()
-                break
+            try:
+                if self.all_thread_is_done():
+                    self._stop_all_thread()
+                    break
+
+            except Exception as e:
+                log.exception(e)
 
             tools.delay_time(1)  # 1秒钟检查一次爬虫状态
 
         self.delete_tables([self._redis_key + "*"])
-
-    def record_spider_state(
-        self,
-        spider_type,
-        state,
-        batch_date=None,
-        spider_start_time=None,
-        spider_end_time=None,
-        batch_interval=None,
-    ):
-        pass

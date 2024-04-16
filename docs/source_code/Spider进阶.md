@@ -12,7 +12,7 @@ def __init__(
     begin_callback=None,
     end_callback=None,
     delete_keys=(),
-    auto_stop_when_spider_done=None,
+    keep_alive=None,
     auto_start_requests=None,
     send_run_time=False,
     batch_interval=0,
@@ -26,7 +26,7 @@ def __init__(
     @param begin_callback: 爬虫开始回调函数
     @param end_callback: 爬虫结束回调函数
     @param delete_keys: 爬虫启动时删除的key，类型: 元组/bool/string。 支持正则; 常用于清空任务队列，否则重启时会断点续爬
-    @param auto_stop_when_spider_done: 爬虫抓取完毕后是否自动结束或等待任务，默认自动结束
+    @param keep_alive: 爬虫是否常驻
     @param auto_start_requests: 爬虫是否自动添加任务
     @param send_run_time: 发送运行时间
     @param batch_interval: 抓取时间间隔 默认为0 天为单位 多次启动时，只有当前时间与第一次抓取结束的时间间隔大于指定的时间间隔时，爬虫才启动
@@ -46,9 +46,9 @@ redis_key为redis中存储任务等信息的key前缀，如redis_key="feapder:sp
 key的命名方式为[配置文件](source_code/配置文件.md)中定义的
 
     # 任务表模版
-    TAB_REQUSETS = "{redis_key}:z_requsets"
+    TAB_REQUESTS = "{redis_key}:z_requsets"
     # 任务失败模板
-    TAB_FAILED_REQUSETS = "{redis_key}:z_failed_requsets"
+    TAB_FAILED_REQUESTS = "{redis_key}:z_failed_requsets"
     # 爬虫状态表模版
     TAB_SPIDER_STATUS = "{redis_key}:z_spider_status"
     # item 表模版
@@ -107,11 +107,11 @@ delete_keys 接收类型为tuple/bool/string，支持正则，拿以下的key举
 
 删除全部可写为`delete_keys="*"`
 
-### 4. auto_stop_when_spider_done
+### 4. keep_alive
 
 用于`spider.start_monitor_task()` 与 `spider.start()` 这种master、worker模式。
 
-`auto_stop_when_spider_done=False`时，爬虫做完任务后不会退出，继续等待任务。
+`keep_alive=True`时，爬虫做完任务后不会退出，继续等待任务。
 
 ### 5. send_run_time
 
@@ -137,11 +137,11 @@ Spider继承至BaseParser，并且BaseParser是对开发者暴露的常用方法
 
 ### 1. start_monitor_task
 
-下发及监控任务，与`auto_stop_when_spider_done`参数配合使用，用于常驻进程的爬虫
+下发及监控任务，与`keep_alive`参数配合使用，用于常驻进程的爬虫
 
 使用：
 
-    spider = test_spider.TestSpider(redis_key="feapder:test_spider", auto_stop_when_spider_done=False)
+    spider = test_spider.TestSpider(redis_key="feapder:test_spider", keep_alive=True)
     # 下发及监控任务
     spider.start_monitor_task()
     # 采集（进程常驻）
@@ -155,11 +155,11 @@ Spider继承至BaseParser，并且BaseParser是对开发者暴露的常用方法
 
 Spider爬虫支持任务防丢，断点续爬，实现原理如下：
 
-Spider利用了redis有序集合来存储任务，有序集合有个分数，爬虫取任务时，只取小于当前时间搓分数的任务，同时将任务分数修改为当前时间搓+10分钟，（这个取任务与改分数是原子性的操作）。**当任务做完时，且数据已入库后，再主动将任务删除。**
+Spider利用了redis有序集合来存储任务，有序集合有个分数，爬虫取任务时，只取小于当前时间戳分数的任务，同时将任务分数修改为当前时间戳+10分钟，（这个取任务与改分数是原子性的操作）。**当任务做完时，且数据已入库后，再主动将任务删除。**
 
 目的：将取到的任务分数修改成10分钟后，可防止其他爬虫节点取到同样的任务，同时当爬虫意外退出后，任务也不会丢失，10分钟后还可以取到。
 
-10分钟是可配置的，为配置文件中的`REQUEST_TIME_OUT`参数
+10分钟是可配置的，为配置文件中的`REQUEST_LOST_TIMEOUT`参数
 
 ### 2. 任务重试
 
@@ -196,8 +196,8 @@ from feapder.buffer.request_buffer import RequestBuffer
 from feapder.buffer.item_buffer import ItemBuffer
 from feapder.dedup import Dedup
 
-RequestBuffer.dedup = Dedup(filter_type=MemoryError)
-ItemBuffer.dedup = Dedup(filter_type=MemoryError)
+RequestBuffer.dedup = Dedup(filter_type=Dedup.MemoryFilter)
+ItemBuffer.dedup = Dedup(filter_type=Dedup.MemoryFilter)
 ```
 
 RequestBuffer 为任务入库前缓冲的buffer，ItemBuffer为数据入库前缓冲的buffer
@@ -218,8 +218,6 @@ COLLECTOR_TASK_COUNT = 10 # 每次获取任务数量
 SPIDER_THREAD_COUNT = 1 # 爬虫并发数
 SPIDER_SLEEP_TIME = 0 # 下载时间间隔（解析完一个response后休眠时间）
 SPIDER_MAX_RETRY_TIMES = 100 # 每个请求最大重试次数
-# 是否主动执行添加 设置为False 需要手动调用start_monitor_task，适用于多进程情况下
-
 ```
 
 COLLECTOR 为从任务队列中取任务到内存队列的线程，SPIDER为实际采集的线程

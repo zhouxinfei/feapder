@@ -8,40 +8,43 @@ Created on 2018-07-25 11:49:08
 @email:  boris_liu@foxmail.com
 """
 
+import copy
+import os
+import re
+
 import requests
-from requests.adapters import HTTPAdapter
+from requests.cookies import RequestsCookieJar
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 import feapder.setting as setting
 import feapder.utils.tools as tools
 from feapder.db.redisdb import RedisDB
 from feapder.network import user_agent
-from feapder.network.item import Item
-from feapder.network.proxy_pool import proxy_pool
+from feapder.network.downloader.base import Downloader, RenderDownloader
+from feapder.network.proxy_pool import BaseProxyPool
 from feapder.network.response import Response
 from feapder.utils.log import log
-from feapder.utils.perfect_dict import PerfectDict
-from feapder.utils.webdriver import WebDriverPool
 
 # 屏蔽warning信息
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 
-class Request(object):
-    session = None
-    webdriver_pool: WebDriverPool = None
+class Request:
     user_agent_pool = user_agent
-    proxies_pool = proxy_pool
+    proxies_pool: BaseProxyPool = None
 
     cache_db = None  # redis / pika
     cached_redis_key = None  # 缓存response的文件文件夹 response_cached:cached_redis_key:md5
     cached_expire_time = 1200  # 缓存过期时间
 
-    local_filepath = None
-    oss_handler = None
+    # 下载器
+    downloader: Downloader = None
+    session_downloader: Downloader = None
+    render_downloader: RenderDownloader = None
 
-    __REQUEST_ATTRS__ = [
-        # 'method', 'url', 必须传递 不加入**kwargs中
+    __REQUEST_ATTRS__ = {
+        # "method",
+        # "url",
         "params",
         "data",
         "headers",
@@ -56,10 +59,11 @@ class Request(object):
         "verify",
         "cert",
         "json",
-    ]
+    }
 
-    DEFAULT_KEY_VALUE = dict(
+    _DEFAULT_KEY_VALUE_ = dict(
         url="",
+        method=None,
         retry_times=0,
         priority=300,
         parser_name=None,
@@ -72,7 +76,15 @@ class Request(object):
         download_midware=None,
         is_abandoned=False,
         render=False,
+        render_time=0,
+        make_absolute_links=None,
     )
+
+    _CUSTOM_PROPERTIES_ = {
+        "requests_kwargs",
+        "custom_ua",
+        "custom_proxies",
+    }
 
     def __init__(
         self,
@@ -89,6 +101,8 @@ class Request(object):
         download_midware=None,
         is_abandoned=False,
         render=False,
+        render_time=0,
+        make_absolute_links=None,
         **kwargs,
     ):
         """
@@ -108,8 +122,10 @@ class Request(object):
         @param download_midware: 下载中间件。默认为parser中的download_midware
         @param is_abandoned: 当发生异常时是否放弃重试 True/False. 默认False
         @param render: 是否用浏览器渲染
+        @param render_time: 渲染时长，即打开网页等待指定时间后再获取源码
+        @param make_absolute_links: 是否转成绝对连接，默认是
         --
-        以下参数于requests参数使用方式一致
+        以下参数与requests参数使用方式一致
         @param method: 请求方式，如POST或GET，默认根据data值是否为空来判断
         @param params: 请求参数
         @param data: 请求body
@@ -131,6 +147,7 @@ class Request(object):
         """
 
         self.url = url
+        self.method = None
         self.retry_times = retry_times
         self.priority = priority
         self.parser_name = parser_name
@@ -143,13 +160,23 @@ class Request(object):
         self.download_midware = download_midware
         self.is_abandoned = is_abandoned
         self.render = render
+        self.render_time = render_time
+        self.make_absolute_links = (
+            make_absolute_links
+            if make_absolute_links is not None
+            else setting.MAKE_ABSOLUTE_LINKS
+        )
 
+        # 自定义属性，不参与序列化
         self.requests_kwargs = {}
         for key, value in kwargs.items():
             if key in self.__class__.__REQUEST_ATTRS__:  # 取requests参数
                 self.requests_kwargs[key] = value
 
             self.__dict__[key] = value
+
+        self.custom_ua = False
+        self.custom_proxies = False
 
     def __repr__(self):
         try:
@@ -169,29 +196,50 @@ class Request(object):
         if key in self.__class__.__REQUEST_ATTRS__:
             self.requests_kwargs[key] = value
 
+    # def __getattr__(self, item):
+    #     try:
+    #         return self.__dict__[item]
+    #     except:
+    #         raise AttributeError("Request has no attribute %s" % item)
+
     def __lt__(self, other):
         return self.priority < other.priority
 
     @property
-    def _session(self):
-        use_session = (
-            setting.USE_SESSION if self.use_session is None else self.use_session
-        )  # self.use_session 优先级高
-        if use_session and not self.__class__.session:
-            self.__class__.session = requests.Session()
-            # pool_connections – 缓存的 urllib3 连接池个数  pool_maxsize – 连接池中保存的最大连接数
-            http_adapter = HTTPAdapter(pool_connections=1000, pool_maxsize=1000)
-            # 任何使用该session会话的 HTTP 请求，只要其 URL 是以给定的前缀开头，该传输适配器就会被使用到。
-            self.__class__.session.mount("http", http_adapter)
+    def _proxies_pool(self):
+        if not self.__class__.proxies_pool:
+            self.__class__.proxies_pool = tools.import_cls(setting.PROXY_POOL)()
 
-        return self.__class__.session
+        return self.__class__.proxies_pool
 
     @property
-    def _webdriver_pool(self):
-        if not self.__class__.webdriver_pool:
-            self.__class__.webdriver_pool = WebDriverPool(**setting.WEBDRIVER)
+    def _downloader(self):
+        if not self.__class__.downloader:
+            self.__class__.downloader = tools.import_cls(setting.DOWNLOADER)()
 
-        return self.__class__.webdriver_pool
+        return self.__class__.downloader
+
+    @property
+    def _session_downloader(self):
+        if not self.__class__.session_downloader:
+            self.__class__.session_downloader = tools.import_cls(
+                setting.SESSION_DOWNLOADER
+            )()
+
+        return self.__class__.session_downloader
+
+    @property
+    def _render_downloader(self):
+        if not self.__class__.render_downloader:
+            try:
+                self.__class__.render_downloader = tools.import_cls(
+                    setting.RENDER_DOWNLOADER
+                )()
+            except AttributeError:
+                log.error('当前是渲染模式，请安装 pip install "feapder[render]"')
+                os._exit(0)
+
+        return self.__class__.render_downloader
 
     @property
     def to_dict(self):
@@ -202,38 +250,66 @@ class Request(object):
             if callable(self.callback)
             else self.callback
         )
-        self.download_midware = (
-            getattr(self.download_midware, "__name__")
-            if callable(self.download_midware)
-            else self.download_midware
-        )
+
+        if isinstance(self.download_midware, (tuple, list)):
+            self.download_midware = [
+                getattr(download_midware, "__name__")
+                if callable(download_midware)
+                and download_midware.__class__.__name__ == "method"
+                else download_midware
+                for download_midware in self.download_midware
+            ]
+        else:
+            self.download_midware = (
+                getattr(self.download_midware, "__name__")
+                if callable(self.download_midware)
+                and self.download_midware.__class__.__name__ == "method"
+                else self.download_midware
+            )
 
         for key, value in self.__dict__.items():
             if (
-                key in self.__class__.DEFAULT_KEY_VALUE
-                and self.__class__.DEFAULT_KEY_VALUE.get(key) == value
-                or key == "requests_kwargs"
+                key in self.__class__._DEFAULT_KEY_VALUE_
+                and self.__class__._DEFAULT_KEY_VALUE_.get(key) == value
+                or key in self.__class__._CUSTOM_PROPERTIES_
             ):
                 continue
 
-            if callable(value) or isinstance(value, (Item, PerfectDict)):
-                value = tools.dumps_obj(value)
+            if value is not None:
+                if key in self.__class__.__REQUEST_ATTRS__:
+                    if not isinstance(
+                        value, (bool, float, int, str, tuple, list, dict)
+                    ):
+                        value = tools.dumps_obj(value)
+                else:
+                    if not isinstance(value, (bool, float, int, str)):
+                        value = tools.dumps_obj(value)
 
             request_dict[key] = value
 
         return request_dict
 
-    def get_response(self, save_cached=False):
+    @property
+    def callback_name(self):
+        return (
+            getattr(self.callback, "__name__")
+            if callable(self.callback)
+            else self.callback
+        )
+
+    def make_requests_kwargs(self):
         """
-        获取带有selector功能的response
-        @param save_cached: 保存缓存 方便调试时不用每次都重新下载
-        @return:
+        处理参数
         """
         # 设置超时默认时间
-        self.requests_kwargs.setdefault("timeout", 22)  # connect=22 read=22
+        self.requests_kwargs.setdefault(
+            "timeout", setting.REQUEST_TIMEOUT
+        )  # connect=22 read=22
 
         # 设置stream
-        # 默认情况下，当你进行网络请求后，响应体会立即被下载。你可以通过 stream 参数覆盖这个行为，推迟下载响应体直到访问 Response.content 属性。此时仅有响应头被下载下来了。缺点： stream 设为 True，Requests 无法将连接释放回连接池，除非你 消耗了所有的数据，或者调用了 Response.close。 这样会带来连接效率低下的问题。
+        # 默认情况下，当你进行网络请求后，响应体会立即被下载。
+        # stream=True是，调用Response.content 才会下载响应体，默认只返回header。
+        # 缺点： stream 设为 True，Requests 无法将连接释放回连接池，除非消耗了所有的数据，或者调用了 Response.close。 这样会带来连接效率低下的问题。
         self.requests_kwargs.setdefault("stream", True)
 
         # 关闭证书验证
@@ -242,39 +318,55 @@ class Request(object):
         # 设置请求方法
         method = self.__dict__.get("method")
         if not method:
-            if "data" in self.requests_kwargs:
+            if "data" in self.requests_kwargs or "json" in self.requests_kwargs:
                 method = "POST"
             else:
                 method = "GET"
+        self.method = method
 
-        # 随机user—agent
+        # 设置user—agent
         headers = self.requests_kwargs.get("headers", {})
         if "user-agent" not in headers and "User-Agent" not in headers:
             if self.random_user_agent and setting.RANDOM_HEADERS:
-                headers.update({"User-Agent": self.__class__.user_agent_pool.get()})
+                # 随机user—agent
+                ua = self.__class__.user_agent_pool.get(setting.USER_AGENT_TYPE)
+                headers.update({"User-Agent": ua})
                 self.requests_kwargs.update(headers=headers)
+            else:
+                # 使用默认的user—agent
+                self.requests_kwargs.setdefault(
+                    "headers", {"User-Agent": setting.DEFAULT_USERAGENT}
+                )
         else:
-            self.requests_kwargs.setdefault(
-                "headers", {"User-Agent": setting.DEFAULT_USERAGENT}
-            )
+            self.custom_ua = True
 
         # 代理
         proxies = self.requests_kwargs.get("proxies", -1)
-        if proxies == -1 and setting.PROXY_ENABLE and self.__class__.proxies_pool:
+        if proxies == -1 and setting.PROXY_ENABLE and setting.PROXY_EXTRACT_API:
             while True:
-                proxies = self.__class__.proxies_pool.get()
+                proxies = self._proxies_pool.get_proxy()
                 if proxies:
                     self.requests_kwargs.update(proxies=proxies)
                     break
                 else:
                     log.debug("暂无可用代理 ...")
+        else:
+            self.custom_proxies = True
+
+    def get_response(self, save_cached=False):
+        """
+        获取带有selector功能的response
+        @param save_cached: 保存缓存 方便调试时不用每次都重新下载
+        @return:
+        """
+        self.make_requests_kwargs()
 
         log.debug(
             """
                 -------------- %srequest for ----------------
                 url  = %s
                 method = %s
-                body = %s
+                args = %s
                 """
             % (
                 ""
@@ -291,7 +383,7 @@ class Request(object):
                     or "parse",
                 ),
                 self.url,
-                method,
+                self.method,
                 self.requests_kwargs,
             )
         )
@@ -301,54 +393,74 @@ class Request(object):
         #
         # self.requests_kwargs.update(hooks={'response': hooks})
 
+        # self.use_session 优先级高
         use_session = (
             setting.USE_SESSION if self.use_session is None else self.use_session
-        )  # self.use_session 优先级高
+        )
 
         if self.render:
-            browser = self._webdriver_pool.get()
-
-            try:
-                browser.get(self.url)
-                render_time = setting.WEBDRIVER.get("render_time", 0)
-                if render_time:
-                    tools.delay_time(render_time)
-
-                html = browser.page_source
-                response = Response.from_dict(
-                    {
-                        "url": browser.current_url,
-                        "cookies": browser.cookies,
-                        "text": html,
-                        "_content": html.encode(),
-                        "status_code": 200,
-                        "elapsed": 666,
-                        "headers": {
-                            "User-Agent": browser.execute_script(
-                                "return navigator.userAgent"
-                            )
-                        },
-                    }
-                )
-
-                response._cached_text = html
-                # response.browser = browser # 因为浏览器渲染完就释放了，所以不能绑定到response上
-                self._webdriver_pool.put(browser)
-            except Exception as e:
-                self._webdriver_pool.remove(browser)
-                raise e
-
+            response = self._render_downloader.download(self)
         elif use_session:
-            response = self._session.request(method, self.url, **self.requests_kwargs)
-            response = Response(response)
+            response = self._session_downloader.download(self)
         else:
-            response = requests.request(method, self.url, **self.requests_kwargs)
-            response = Response(response)
+            response = self._downloader.download(self)
+
+        response.make_absolute_links = self.make_absolute_links
 
         if save_cached:
             self.save_cached(response, expire_time=self.__class__.cached_expire_time)
 
         return response
+
+    def get_params(self):
+        return self.requests_kwargs.get("params")
+
+    def get_proxies(self) -> dict:
+        """
+
+        Returns: {"https": "https://ip:port", "http": "http://ip:port"}
+
+        """
+        return self.requests_kwargs.get("proxies")
+
+    def get_proxy(self) -> str:
+        """
+
+        Returns: ip:port
+
+        """
+        proxies = self.get_proxies()
+        if proxies:
+            return re.sub(
+                "http.*?//", "", proxies.get("http", "") or proxies.get("https", "")
+            )
+
+    def del_proxy(self):
+        proxy = self.get_proxy()
+        if proxy:
+            self._proxies_pool.del_proxy(proxy)
+            del self.requests_kwargs["proxies"]
+
+    def get_headers(self) -> dict:
+        return self.requests_kwargs.get("headers", {})
+
+    def get_user_agent(self) -> str:
+        return self.get_headers().get("user_agent") or self.get_headers().get(
+            "User-Agent"
+        )
+
+    def get_cookies(self) -> dict:
+        cookies = self.requests_kwargs.get("cookies")
+        if cookies and isinstance(cookies, RequestsCookieJar):
+            cookies = cookies.get_dict()
+
+        if not cookies:
+            cookie_str = self.get_headers().get("Cookie") or self.get_headers().get(
+                "cookie"
+            )
+            if cookie_str:
+                cookies = tools.get_cookies_from_str(cookie_str)
+        return cookies
 
     @property
     def fingerprint(self):
@@ -428,4 +540,4 @@ class Request(object):
         return cls(**request_dict)
 
     def copy(self):
-        return self.__class__.from_dict(self.to_dict)
+        return self.__class__.from_dict(copy.deepcopy(self.to_dict))

@@ -5,7 +5,7 @@ Created on 2018/12/14 1:05 PM
 @summary:
 ---------
 @author: Boris
-@email: boris@bzkj.tech
+@email: boris_liu@foxmail.com
 """
 
 from __future__ import absolute_import
@@ -48,7 +48,7 @@ class MemoryBitArray(BitArray):
             import bitarray
         except Exception as e:
             raise Exception(
-                "需要安装feapder完整版\ncommand: pip install feapder[all]\n若安装出错，参考：https://boris.org.cn/feapder/#/question/%E5%AE%89%E8%A3%85%E9%97%AE%E9%A2%98"
+                '需要安装feapder完整版\ncommand: pip install "feapder[all]"\n若安装出错，参考：https://feapder.com/#/question/%E5%AE%89%E8%A3%85%E9%97%AE%E9%A2%98'
             )
 
         self.num_bits = num_bits
@@ -127,7 +127,18 @@ class RedisBitArray(BitArray):
         @param values: 支持列表或单个值
         @return: list / 单个值
         """
-        return self.redis_db.setbit(self.name, offsets, values)
+        # 对offsets进行分片，最大100000个
+        results = []
+        batch_size = 170000
+        for i in range(0, len(offsets), batch_size):
+            results.extend(
+                self.redis_db.setbit(
+                    self.name,
+                    offsets[i : i + batch_size],
+                    values[i : i + batch_size] if isinstance(values, list) else values,
+                )
+            )
+        return results
 
     def get(self, offsets):
         return self.redis_db.getbit(self.name, offsets)
@@ -138,6 +149,6 @@ class RedisBitArray(BitArray):
         if count:
             return int(count)
         else:
-            count = self.redis_db.bitcount(self.name)
+            count = self.redis_db.bitcount(self.name)  # 被设置为 1 的比特位的数量
             self.redis_db.strset(self.count_cached_name, count, ex=1800)  # 半小时过期
             return count

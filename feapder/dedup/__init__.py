@@ -5,7 +5,7 @@ Created on 2018-12-13 21:08
 @summary:
 ---------
 @author: Boris
-@email: boris@bzkj.tech
+@email: boris_liu@foxmail.com
 """
 
 import copy
@@ -14,26 +14,30 @@ from typing import Any, List, Union, Optional, Tuple, Callable
 from feapder.utils.tools import get_md5
 from .bloomfilter import BloomFilter, ScalableBloomFilter
 from .expirefilter import ExpireFilter
+from .litefilter import LiteFilter
 
 
 class Dedup:
     BloomFilter = 1
     MemoryFilter = 2
     ExpireFilter = 3
+    LiteFilter = 4
 
     def __init__(self, filter_type: int = BloomFilter, to_md5: bool = True, **kwargs):
         """
-        去重过滤器 集成BloomFilter、MemoryFilter、ExpireFilter
+        去重过滤器 集成BloomFilter、MemoryFilter、ExpireFilter、MemoryLiteFilter
         Args:
             filter_type: 过滤器类型 BloomFilter
             name: 过滤器名称 该名称会默认以dedup作为前缀 dedup:expire_set:[name]/dedup:bloomfilter:[name]。 默认ExpireFilter name=过期时间; BloomFilter name=dedup:bloomfilter:bloomfilter
-            absolute_name: 过滤器绝对名称 不会加dedup前缀
+            absolute_name: 过滤器绝对名称 不会加dedup前缀，当此值不为空时name参数无效
             expire_time: ExpireFilter的过期时间 单位为秒，其他两种过滤器不用指定
             error_rate: BloomFilter/MemoryFilter的误判率 默认为0.00001
             to_md5: 去重前是否将数据转为MD5，默认是
             redis_url: redis://[[username]:[password]]@localhost:6379/0
                        BloomFilter 与 ExpireFilter 使用
                        默认会读取setting中的redis配置，若无setting，则需要专递redis_url
+            initial_capacity: 单个布隆过滤器去重容量 默认100000000，当布隆过滤器容量满时会扩展下一个布隆过滤器
+            error_rate：布隆过滤器的误判率 默认0.00001
             **kwargs:
         """
 
@@ -54,6 +58,9 @@ class Dedup:
                 expire_time_record_key=expire_time_record_key,
                 redis_url=kwargs.get("redis_url"),
             )
+
+        elif filter_type == Dedup.LiteFilter:
+            self.dedup = LiteFilter()
 
         else:
             initial_capacity = kwargs.get("initial_capacity", 100000000)

@@ -29,7 +29,7 @@ REDISDB_DB = 0
 # # 重新尝试失败的requests 当requests重试次数超过允许的最大重试次数算失败
 # RETRY_FAILED_REQUESTS = False
 # # request 超时时间，超过这个时间重新做（不是网络请求的超时时间）单位秒
-# REQUEST_TIME_OUT = 600  # 10分钟
+# REQUEST_LOST_TIMEOUT = 600  # 10分钟
 # # 保存失败的request
 # SAVE_FAILED_REQUEST = True
 #
@@ -41,8 +41,8 @@ REDISDB_DB = 0
 # WARNING_FAILED_COUNT = 1000  # 任务失败数 超过WARNING_FAILED_COUNT则报警
 #
 # # 爬虫初始化工作
-# # 爬虫做完request后是否自动结束或者等待任务
-# AUTO_STOP_WHEN_SPIDER_DONE = True
+# # 爬虫是否常驻
+# KEEP_ALIVE = False
 #
 #
 # # 设置代理

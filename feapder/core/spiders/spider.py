@@ -5,12 +5,12 @@ Created on 2020/4/22 12:05 AM
 @summary:
 ---------
 @author: Boris
-@email: boris@bzkj.tech
+@email: boris_liu@foxmail.com
 """
 
 import time
 import warnings
-from collections import Iterable
+from collections.abc import Iterable
 
 import feapder.setting as setting
 import feapder.utils.tools as tools
@@ -41,11 +41,11 @@ class Spider(
         begin_callback=None,
         end_callback=None,
         delete_keys=(),
-        auto_stop_when_spider_done=None,
+        keep_alive=None,
         auto_start_requests=None,
-        send_run_time=False,
         batch_interval=0,
         wait_lock=True,
+        **kwargs
     ):
         """
         @summary: 爬虫
@@ -57,9 +57,8 @@ class Spider(
         @param begin_callback: 爬虫开始回调函数
         @param end_callback: 爬虫结束回调函数
         @param delete_keys: 爬虫启动时删除的key，类型: 元组/bool/string。 支持正则; 常用于清空任务队列，否则重启时会断点续爬
-        @param auto_stop_when_spider_done: 爬虫抓取完毕后是否自动结束或等待任务，默认自动结束
+        @param keep_alive: 爬虫是否常驻
         @param auto_start_requests: 爬虫是否自动添加任务
-        @param send_run_time: 发送运行时间
         @param batch_interval: 抓取时间间隔 默认为0 天为单位 多次启动时，只有当前时间与第一次抓取结束的时间间隔大于指定的时间间隔时，爬虫才启动
         @param wait_lock: 下发任务时否等待锁，若不等待锁，可能会存在多进程同时在下发一样的任务，因此分布式环境下请将该值设置True
         ---------
@@ -71,11 +70,11 @@ class Spider(
             begin_callback=begin_callback,
             end_callback=end_callback,
             delete_keys=delete_keys,
-            auto_stop_when_spider_done=auto_stop_when_spider_done,
+            keep_alive=keep_alive,
             auto_start_requests=auto_start_requests,
-            send_run_time=send_run_time,
             batch_interval=batch_interval,
             wait_lock=wait_lock,
+            **kwargs
         )
 
         self._min_task_count = min_task_count
@@ -97,7 +96,7 @@ class Spider(
         while True:
             try:
                 # 检查redis中是否有任务
-                tab_requests = setting.TAB_REQUSETS.format(redis_key=self._redis_key)
+                tab_requests = setting.TAB_REQUESTS.format(redis_key=self._redis_key)
                 todo_task_count = redisdb.zget_count(tab_requests)
 
                 if todo_task_count < self._min_task_count:  # 添加任务
@@ -110,7 +109,7 @@ class Spider(
             except Exception as e:
                 log.exception(e)
 
-            if self._auto_stop_when_spider_done:
+            if not self._keep_alive:
                 break
 
             time.sleep(self._check_task_interval)
@@ -161,13 +160,6 @@ class Spider(
         if self._is_distributed_task:  # 有任务时才提示启动爬虫
             # begin
             self.spider_begin()
-            self.record_spider_state(
-                spider_type=1,
-                state=0,
-                batch_date=tools.get_current_date(),
-                spider_start_time=tools.get_current_date(),
-                batch_interval=self._batch_interval,
-            )
 
             # 重置已经提示无任务状态为False
             self._is_show_not_task = False
@@ -191,26 +183,22 @@ class Spider(
         self._start()
 
         while True:
-            if self.all_thread_is_done():
-                if not self._is_notify_end:
-                    self.spider_end()  # 跑完一轮
-                    self.record_spider_state(
-                        spider_type=1,
-                        state=1,
-                        spider_end_time=tools.get_current_date(),
-                        batch_interval=self._batch_interval,
-                    )
+            try:
+                if self._stop_spider or self.all_thread_is_done():
+                    if not self._is_notify_end:
+                        self.spider_end()  # 跑完一轮
+                        self._is_notify_end = True
 
-                    self._is_notify_end = True
+                    if not self._keep_alive:
+                        self._stop_all_thread()
+                        break
 
-                if self._auto_stop_when_spider_done:
-                    self._stop_all_thread()
-                    break
+                else:
+                    self._is_notify_end = False
 
-            else:
-                self._is_notify_end = False
-
-            self.check_task_status()
+                self.check_task_status()
+            except Exception as e:
+                log.exception(e)
 
             tools.delay_time(1)  # 1秒钟检查一次爬虫状态
 
@@ -228,14 +216,12 @@ class DebugSpider(Spider):
     """
 
     __debug_custom_setting__ = dict(
-        COLLECTOR_SLEEP_TIME=1,
         COLLECTOR_TASK_COUNT=1,
         # SPIDER
         SPIDER_THREAD_COUNT=1,
         SPIDER_SLEEP_TIME=0,
-        SPIDER_TASK_COUNT=1,
         SPIDER_MAX_RETRY_TIMES=10,
-        REQUEST_TIME_OUT=600,  # 10分钟
+        REQUEST_LOST_TIMEOUT=600,  # 10分钟
         PROXY_ENABLE=False,
         RETRY_FAILED_REQUESTS=False,
         # 保存失败的request
@@ -245,13 +231,15 @@ class DebugSpider(Spider):
         REQUEST_FILTER_ENABLE=False,
         OSS_UPLOAD_TABLES=(),
         DELETE_KEYS=True,
-        ITEM_PIPELINES=[CONSOLE_PIPELINE_PATH],
     )
 
-    def __init__(self, request=None, request_dict=None, *args, **kwargs):
+    def __init__(
+        self, request=None, request_dict=None, save_to_db=False, *args, **kwargs
+    ):
         """
         @param request: request 类对象
         @param request_dict: request 字典。 request 与 request_dict 二者选一即可
+        @param save_to_db: 数据是否入库 默认否
         @param kwargs:
         """
         warnings.warn(
@@ -262,6 +250,10 @@ class DebugSpider(Spider):
             raise Exception("request 与 request_dict 不能同时为null")
 
         kwargs["redis_key"] = kwargs["redis_key"] + "_debug"
+        if not save_to_db:
+            self.__class__.__debug_custom_setting__["ITEM_PIPELINES"] = [
+                CONSOLE_PIPELINE_PATH
+            ]
         self.__class__.__custom_setting__.update(
             self.__class__.__debug_custom_setting__
         )
@@ -272,22 +264,6 @@ class DebugSpider(Spider):
 
     def save_cached(self, request, response, table):
         pass
-
-    def delete_tables(self, delete_tables_list):
-        if isinstance(delete_tables_list, bool):
-            delete_tables_list = [self._redis_key + "*"]
-        elif not isinstance(delete_tables_list, (list, tuple)):
-            delete_tables_list = [delete_tables_list]
-
-        redis = RedisDB()
-        for delete_tab in delete_tables_list:
-            if delete_tab == "*":
-                delete_tab = self._redis_key + "*"
-
-            tables = redis.getkeys(delete_tab)
-            for table in tables:
-                log.info("正在删除表 %s" % table)
-                redis.clear(table)
 
     def __start_requests(self):
         yield self._request
@@ -331,13 +307,6 @@ class DebugSpider(Spider):
         if self._is_distributed_task:  # 有任务时才提示启动爬虫
             # begin
             self.spider_begin()
-            self.record_spider_state(
-                spider_type=1,
-                state=0,
-                batch_date=tools.get_current_date(),
-                spider_start_time=tools.get_current_date(),
-                batch_interval=self._batch_interval,
-            )
 
             # 重置已经提示无任务状态为False
             self._is_show_not_task = False
@@ -350,17 +319,6 @@ class DebugSpider(Spider):
             # self.send_msg(msg)
 
             self._is_show_not_task = True
-
-    def record_spider_state(
-        self,
-        spider_type,
-        state,
-        batch_date=None,
-        spider_start_time=None,
-        spider_end_time=None,
-        batch_interval=None,
-    ):
-        pass
 
     def _start(self):
         # 启动parser 的 start_requests
@@ -423,9 +381,12 @@ class DebugSpider(Spider):
         self._start()
 
         while True:
-            if self.all_thread_is_done():
-                self._stop_all_thread()
-                break
+            try:
+                if self.all_thread_is_done():
+                    self._stop_all_thread()
+                    break
+            except Exception as e:
+                log.exception(e)
 
             tools.delay_time(1)  # 1秒钟检查一次爬虫状态
 

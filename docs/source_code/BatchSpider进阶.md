@@ -23,7 +23,7 @@ def __init__(
     begin_callback=None,
     end_callback=None,
     delete_keys=(),
-    auto_stop_when_spider_done=None,
+    keep_alive=None,
     send_run_time=False,
 ):
     """
@@ -58,7 +58,7 @@ def __init__(
     @param begin_callback: 爬虫开始回调函数
     @param end_callback: 爬虫结束回调函数
     @param delete_keys: 爬虫启动时删除的key，类型: 元组/bool/string。 支持正则; 常用于清空任务队列，否则重启时会断点续爬
-    @param auto_stop_when_spider_done: 爬虫抓取完毕后是否自动结束或等待任务，默认自动结束
+    @param keep_alive: 爬虫是否常驻，默认否
     @param send_run_time: 发送运行时间
     @param related_redis_key: 有关联的其他爬虫任务表（redis）注意：要避免环路 如 A -> B & B -> A 。
     @param related_batch_record: 有关联的其他爬虫批次表（mysql）注意：要避免环路 如 A -> B & B -> A 。
@@ -112,7 +112,7 @@ def crawl_detail(args):
         spider.start()
 ```
 
-若批次爬虫和批次爬虫之前有依赖，除了设置related_redis_key参数外，还支持设置related_batch_record参数，指定对方的批次记录表即可。两个参数二选一
+若批次爬虫和批次爬虫之间有依赖，除了设置related_redis_key参数外，还支持设置related_batch_record参数，指定对方的批次记录表即可。两个参数二选一
 
 ### 2. task_condition
 
@@ -186,8 +186,8 @@ from feapder.buffer.request_buffer import RequestBuffer
 from feapder.buffer.item_buffer import ItemBuffer
 from feapder.dedup import Dedup
 
-RequestBuffer.dedup = Dedup(filter_type=MemoryError)
-ItemBuffer.dedup = Dedup(filter_type=MemoryError)
+RequestBuffer.dedup = Dedup(filter_type=Dedup.MemoryFilter)
+ItemBuffer.dedup = Dedup(filter_type=Dedup.MemoryFilter)
 ```
 
 RequestBuffer 为任务入库前缓冲的buffer，ItemBuffer为数据入库前缓冲的buffer

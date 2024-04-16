@@ -5,7 +5,7 @@ Created on 2020/2/19 12:57 PM
 @summary:
 ---------
 @author: Boris
-@email: boris@bzkj.tech
+@email: boris_liu@foxmail.com
 """
 
 import os
@@ -20,16 +20,13 @@ from feapder.utils.log import log
 
 class EmailSender(object):
     SENDER = "feapder报警系统"
-    SMTPSERVER = "smtp.163.com"
 
-    def __init__(self, username, password):
+    def __init__(self, username, password, smtpserver="smtp.163.com"):
         self.username = username
         self.password = password
-
-        self.smtpserver = EmailSender.SMTPSERVER
+        self.smtpserver = smtpserver
+        self.smtp_client = smtplib.SMTP_SSL(smtpserver)
         self.sender = EmailSender.SENDER
-
-        self.smtp_client = smtplib.SMTP_SSL()
 
     def __enter__(self):
         self.login()
@@ -70,7 +67,9 @@ class EmailSender(object):
         message["From"] = formataddr(
             (self.sender, self.username)
         )  # 括号里的对应发件人邮箱昵称、发件人邮箱账号
-        message["To"] = formataddr((receivers[0], receivers[0]))  # ",".join(receivers)
+        message["To"] = ",".join(
+            [formataddr((receiver, receiver)) for receiver in receivers]
+        )
 
         message["Subject"] = Header(title, "utf-8")
 

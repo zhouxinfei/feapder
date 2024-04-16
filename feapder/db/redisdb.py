@@ -6,13 +6,51 @@ Created on 2016-11-16 16:25
 ---------
 @author: Boris
 """
+import os
+import time
+from typing import Union, List
 
 import redis
+from redis.connection import Encoder as _Encoder
+from redis.exceptions import ConnectionError, TimeoutError
+from redis.exceptions import DataError
 from redis.sentinel import Sentinel
-from rediscluster import RedisCluster
 
 import feapder.setting as setting
 from feapder.utils.log import log
+
+
+class Encoder(_Encoder):
+    def encode(self, value):
+        "Return a bytestring or bytes-like representation of the value"
+        if isinstance(value, (bytes, memoryview)):
+            return value
+        # elif isinstance(value, bool):
+        #     # special case bool since it is a subclass of int
+        #     raise DataError(
+        #         "Invalid input of type: 'bool'. Convert to a "
+        #         "bytes, string, int or float first."
+        #     )
+        elif isinstance(value, float):
+            value = repr(value).encode()
+        elif isinstance(value, int):
+            # python 2 repr() on longs is '123L', so use str() instead
+            value = str(value).encode()
+        elif isinstance(value, (list, dict, tuple)):
+            value = str(value)
+        elif not isinstance(value, str):
+            # a value we don't know how to deal with. throw an error
+            typename = type(value).__name__
+            raise DataError(
+                "Invalid input of type: '%s'. Convert to a "
+                "bytes, string, int or float first." % typename
+            )
+        if isinstance(value, str):
+            value = value.encode(self.encoding, self.encoding_errors)
+        return value
+
+
+redis.connection.Encoder = Encoder
 
 
 class RedisDB:
@@ -24,8 +62,8 @@ class RedisDB:
         url=None,
         decode_responses=True,
         service_name=None,
-        max_connections=32,
-        **kwargs
+        max_connections=1000,
+        **kwargs,
     ):
         """
         redis的封装
@@ -36,6 +74,7 @@ class RedisDB:
             url:
             decode_responses:
             service_name: 适用于redis哨兵模式
+            max_connections: 同一个redis对象使用的并发数（连接池的最大连接数），超过这个数量会抛出redis.ConnectionError
         """
 
         # 可能会改setting中的值，所以此处不能直接赋值为默认值，需要后加载赋值
@@ -47,77 +86,21 @@ class RedisDB:
             user_pass = setting.REDISDB_USER_PASS
         if service_name is None:
             service_name = setting.REDISDB_SERVICE_NAME
+        if kwargs is None:
+            kwargs = setting.REDISDB_KWARGS
 
         self._is_redis_cluster = False
 
-        try:
-            if not url:
-                if not ip_ports:
-                    raise Exception("未设置redis连接信息")
-
-                ip_ports = (
-                    ip_ports if isinstance(ip_ports, list) else ip_ports.split(",")
-                )
-                if len(ip_ports) > 1:
-                    startup_nodes = []
-                    for ip_port in ip_ports:
-                        ip, port = ip_port.split(":")
-                        startup_nodes.append({"host": ip, "port": port})
-
-                    if service_name:
-                        # log.debug("使用redis哨兵模式")
-                        hosts = [(node["host"], node["port"]) for node in startup_nodes]
-                        sentinel = Sentinel(hosts, socket_timeout=3, **kwargs)
-                        self._redis = sentinel.master_for(
-                            service_name,
-                            password=user_pass,
-                            db=db,
-                            redis_class=redis.StrictRedis,
-                            decode_responses=decode_responses,
-                            max_connections=max_connections,
-                            **kwargs
-                        )
-
-                    else:
-                        # log.debug("使用redis集群模式")
-                        self._redis = RedisCluster(
-                            startup_nodes=startup_nodes,
-                            decode_responses=decode_responses,
-                            password=user_pass,
-                            max_connections=max_connections,
-                            **kwargs
-                        )
-
-                    self._is_redis_cluster = True
-                else:
-                    ip, port = ip_ports[0].split(":")
-                    self._redis = redis.StrictRedis(
-                        host=ip,
-                        port=port,
-                        db=db,
-                        password=user_pass,
-                        decode_responses=decode_responses,
-                        max_connections=max_connections,
-                        **kwargs
-                    )
-            else:
-                self._redis = redis.StrictRedis.from_url(
-                    url, decode_responses=decode_responses
-                )
-
-        except Exception as e:
-            raise
-        else:
-            # if not url:
-            #     log.debug("连接到redis数据库 %s db%s" % (ip_ports, db))
-            # else:
-            #     log.debug("连接到redis数据库 %s" % (url))
-            pass
-
+        self.__redis = None
+        self._url = url
         self._ip_ports = ip_ports
         self._db = db
         self._user_pass = user_pass
-        self._url = url
+        self._decode_responses = decode_responses
+        self._service_name = service_name
+        self._max_connections = max_connections
+        self._kwargs = kwargs
+        self.get_connect()
 
     def __repr__(self):
         if self._url:
@@ -126,6 +109,93 @@ class RedisDB:
         return "<Redisdb ip_ports: {} db:{} user_pass:{}>".format(
             self._ip_ports, self._db, self._user_pass
         )
+
+    @property
+    def _redis(self):
+        try:
+            if not self.__redis.ping():
+                raise ConnectionError("unable to connect to redis")
+        except:
+            self._reconnect()
+
+        return self.__redis
+
+    @_redis.setter
+    def _redis(self, val):
+        self.__redis = val
+
+    def get_connect(self):
+        # 获取数据库连接
+        try:
+            if not self._url:
+                if not self._ip_ports:
+                    raise ConnectionError("未设置 redis 连接信息")
+
+                ip_ports = (
+                    self._ip_ports
+                    if isinstance(self._ip_ports, list)
+                    else self._ip_ports.split(",")
+                )
+                if len(ip_ports) > 1:
+                    startup_nodes = []
+                    for ip_port in ip_ports:
+                        ip, port = ip_port.split(":")
+                        startup_nodes.append({"host": ip, "port": port})
+
+                    if self._service_name:
+                        # log.debug("使用redis哨兵模式")
+                        hosts = [(node["host"], node["port"]) for node in startup_nodes]
+                        sentinel = Sentinel(hosts, socket_timeout=3, **self._kwargs)
+                        self._redis = sentinel.master_for(
+                            self._service_name,
+                            password=self._user_pass,
+                            db=self._db,
+                            redis_class=redis.StrictRedis,
+                            decode_responses=self._decode_responses,
+                            max_connections=self._max_connections,
+                            **self._kwargs,
+                        )
+
+                    else:
+                        try:
+                            from rediscluster import RedisCluster
+                        except ModuleNotFoundError as e:
+                            log.error('请安装 pip install "feapder[all]"')
+                            os._exit(0)
+
+                        # log.debug("使用redis集群模式")
+                        self._redis = RedisCluster(
+                            startup_nodes=startup_nodes,
+                            decode_responses=self._decode_responses,
+                            password=self._user_pass,
+                            max_connections=self._max_connections,
+                            **self._kwargs,
+                        )
+
+                    self._is_redis_cluster = True
+                else:
+                    ip, port = ip_ports[0].split(":")
+                    self._redis = redis.StrictRedis(
+                        host=ip,
+                        port=port,
+                        db=self._db,
+                        password=self._user_pass,
+                        decode_responses=self._decode_responses,
+                        max_connections=self._max_connections,
+                        **self._kwargs,
+                    )
+                    self._is_redis_cluster = False
+            else:
+                self._redis = redis.StrictRedis.from_url(
+                    self._url, decode_responses=self._decode_responses, **self._kwargs
+                )
+                self._is_redis_cluster = False
+
+        except Exception as e:
+            raise e
+
+        # 不要写成self._redis.ping() 否则循环调用了
+        return self.__redis.ping()
 
     @classmethod
     def from_url(cls, url):
@@ -150,9 +220,7 @@ class RedisDB:
         """
 
         if isinstance(values, list):
-            pipe = self._redis.pipeline(
-                transaction=True
-            )  # redis-py默认在执行每次请求都会创建（连接池申请连接）和断开（归还连接池）一次连接操作，如果想要在一次请求中指定多个命令，则可以使用pipeline实现一次请求指定多个命令，并且默认情况下一次pipeline 是原子性操作。
+            pipe = self._redis.pipeline()
 
             if not self._is_redis_cluster:
                 pipe.multi()
@@ -171,14 +239,13 @@ class RedisDB:
         @param is_pop:
         @return:
         """
+
         datas = []
         if is_pop:
             count = count if count <= self.sget_count(table) else self.sget_count(table)
             if count:
                 if count > 1:
-                    pipe = self._redis.pipeline(
-                        transaction=True
-                    )  # redis-py默认在执行每次请求都会创建（连接池申请连接）和断开（归还连接池）一次连接操作，如果想要在一次请求中指定多个命令，则可以使用pipeline实现一次请求指定多个命令，并且默认情况下一次pipeline 是原子性操作。
+                    pipe = self._redis.pipeline()
 
                     if not self._is_redis_cluster:
                         pipe.multi()
@@ -204,10 +271,9 @@ class RedisDB:
         ---------
         @result:
         """
+
         if isinstance(values, list):
-            pipe = self._redis.pipeline(
-                transaction=True
-            )  # redis-py默认在执行每次请求都会创建（连接池申请连接）和断开（归还连接池）一次连接操作，如果想要在一次请求中指定多个命令，则可以使用pipeline实现一次请求指定多个命令，并且默认情况下一次pipeline 是原子性操作。
+            pipe = self._redis.pipeline()
 
             if not self._is_redis_cluster:
                 pipe.multi()
@@ -230,6 +296,7 @@ class RedisDB:
         ---------
         @result:
         """
+
         # 当 SCAN 命令的游标参数被设置为 0 时， 服务器将开始一次新的迭代， 而当服务器向用户返回值为 0 的游标时， 表示迭代已结束
         cursor = "0"
         while cursor != 0:
@@ -260,7 +327,7 @@ class RedisDB:
             else:
                 assert len(values) == len(prioritys), "values值要与prioritys值一一对应"
 
-            pipe = self._redis.pipeline(transaction=True)
+            pipe = self._redis.pipeline()
 
             if not self._is_redis_cluster:
                 pipe.multi()
@@ -285,12 +352,11 @@ class RedisDB:
         ---------
         @result: 列表
         """
+
         start_pos = 0  # 包含
         end_pos = count - 1 if count > 0 else count
 
-        pipe = self._redis.pipeline(
-            transaction=True
-        )  # redis-py默认在执行每次请求都会创建（连接池申请连接）和断开（归还连接池）一次连接操作，如果想要在一次请求中指定多个命令，则可以使用pipeline实现一次请求指定多个命令，并且默认情况下一次pipeline 是原子性操作。
+        pipe = self._redis.pipeline()
 
         if not self._is_redis_cluster:
             pipe.multi()  # 标记事务的开始 参考 http://www.runoob.com/redis/redis-transactions.html
@@ -340,7 +406,7 @@ class RedisDB:
             end
 
             -- 删除redis中刚取到的值
-            if (is_pop) then
+            if (is_pop=='True' or is_pop=='1') then
                 for i=1, #datas do
                     redis.call('zrem', KEYS[1], datas[i])
                 end
@@ -462,6 +528,9 @@ class RedisDB:
 
         return res
 
+    def zincrby(self, table, amount, value):
+        return self._redis.zincrby(table, amount, value)
+
     def zget_count(self, table, priority_min=None, priority_max=None):
         """
         @summary: 获取表数据的数量
@@ -487,6 +556,7 @@ class RedisDB:
         ---------
         @result:
         """
+
         if isinstance(values, list):
             self._redis.zrem(table, *values)
         else:
@@ -498,12 +568,11 @@ class RedisDB:
         @param values:
         @return:
         """
+
         is_exists = []
 
         if isinstance(values, list):
-            pipe = self._redis.pipeline(
-                transaction=True
-            )  # redis-py默认在执行每次请求都会创建（连接池申请连接）和断开（归还连接池）一次连接操作，如果想要在一次请求中指定多个命令，则可以使用pipeline实现一次请求指定多个命令，并且默认情况下一次pipeline 是原子性操作。
+            pipe = self._redis.pipeline()
             pipe.multi()
             for value in values:
                 pipe.zscore(table, value)
@@ -522,18 +591,16 @@ class RedisDB:
 
     def lpush(self, table, values):
         if isinstance(values, list):
-            pipe = self._redis.pipeline(
-                transaction=True
-            )  # redis-py默认在执行每次请求都会创建（连接池申请连接）和断开（归还连接池）一次连接操作，如果想要在一次请求中指定多个命令，则可以使用pipeline实现一次请求指定多个命令，并且默认情况下一次pipeline 是原子性操作。
+            pipe = self._redis.pipeline()
 
             if not self._is_redis_cluster:
                 pipe.multi()
             for value in values:
-                pipe.rpush(table, value)
+                pipe.lpush(table, value)
             pipe.execute()
 
         else:
-            return self._redis.rpush(table, values)
+            return self._redis.lpush(table, values)
 
     def lpop(self, table, count=1):
         """
@@ -544,15 +611,14 @@ class RedisDB:
         ---------
         @result: count>1时返回列表
         """
-        datas = None
 
-        count = count if count <= self.lget_count(table) else self.lget_count(table)
+        datas = None
+        lcount = self.lget_count(table)
+        count = count if count <= lcount else lcount
 
         if count:
             if count > 1:
-                pipe = self._redis.pipeline(
-                    transaction=True
-                )  # redis-py默认在执行每次请求都会创建（连接池申请连接）和断开（归还连接池）一次连接操作，如果想要在一次请求中指定多个命令，则可以使用pipeline实现一次请求指定多个命令，并且默认情况下一次pipeline 是原子性操作。
+                pipe = self._redis.pipeline()
 
                 if not self._is_redis_cluster:
                     pipe.multi()
@@ -595,7 +661,6 @@ class RedisDB:
         ---------
         @result: 删除的条数
         """
-
         return self._redis.lrem(table, num, value)
 
     def lrange(self, table, start=0, end=-1):
@@ -613,7 +678,6 @@ class RedisDB:
         ---------
         @result: 1 新插入； 0 覆盖
         """
-
         return self._redis.hset(table, key, value)
 
     def hset_batch(self, table, datas):
@@ -625,7 +689,7 @@ class RedisDB:
         Returns:
 
         """
-        pipe = self._redis.pipeline(transaction=True)
+        pipe = self._redis.pipeline()
 
         if not self._is_redis_cluster:
             pipe.multi()
@@ -672,35 +736,49 @@ class RedisDB:
         ---------
         @result:
         """
-
         self._redis.hdel(table, *keys)
 
     def hget_count(self, table):
         return self._redis.hlen(table)
 
-    def setbit(self, table, offsets, values):
+    def hkeys(self, table):
+        return self._redis.hkeys(table)
+
+    def hvals(self, key):
+        return self._redis.hvals(key)
+
+    def setbit(
+        self, table, offsets: Union[int, List[int]], values: Union[int, List[int]]
+    ):
         """
-        设置字符串数组某一位的值， 返回之前的值
-        @param table:
+        设置字符串数组某一位的值，返回之前的值
+        @param table: Redis key
         @param offsets: 支持列表或单个值
         @param values: 支持列表或单个值
         @return: list / 单个值
         """
         if isinstance(offsets, list):
-            if not isinstance(values, list):
-                values = [values] * len(offsets)
+            if isinstance(values, int):
+                # 使用lua脚本，数据是一起传给redis的，降低了网络开销，但redis会阻塞
+                script = """
+                            local value = table.remove(ARGV, 1)
+                            local offsets = ARGV
+                            local results = {}
+                            for i, offset in ipairs(offsets) do
+                                results[i] = redis.call('SETBIT', KEYS[1], offset, value)
+                            end
+                            return results
+                        """
+                return self._redis.eval(script, 1, table, values, *offsets)
             else:
                 assert len(offsets) == len(values), "offsets值要与values值一一对应"
+                pipe = self._redis.pipeline()
+                pipe.multi()
 
-            pipe = self._redis.pipeline(
-                transaction=True
-            )  # redis-py默认在执行每次请求都会创建（连接池申请连接）和断开（归还连接池）一次连接操作，如果想要在一次请求中指定多个命令，则可以使用pipeline实现一次请求指定多个命令，并且默认情况下一次pipeline 是原子性操作。
-            pipe.multi()
+                for offset, value in zip(offsets, values):
+                    pipe.setbit(table, offset, value)
 
-            for offset, value in zip(offsets, values):
-                pipe.setbit(table, offset, value)
-
-            return pipe.execute()
+                return pipe.execute()
 
         else:
             return self._redis.setbit(table, offsets, values)
@@ -713,9 +791,7 @@ class RedisDB:
         @return: list / 单个值
         """
         if isinstance(offsets, list):
-            pipe = self._redis.pipeline(
-                transaction=True
-            )  # redis-py默认在执行每次请求都会创建（连接池申请连接）和断开（归还连接池）一次连接操作，如果想要在一次请求中指定多个命令，则可以使用pipeline实现一次请求指定多个命令，并且默认情况下一次pipeline 是原子性操作。
+            pipe = self._redis.pipeline()
             pipe.multi()
             for offset in offsets:
                 pipe.getbit(table, offset)
@@ -729,6 +805,20 @@ class RedisDB:
         return self._redis.bitcount(table)
 
     def strset(self, table, value, **kwargs):
+        """
+        设置键值
+        Args:
+            table:
+            value:
+            **kwargs:
+                ex: Union[None, int, timedelta] = ..., 设置键的过期时间为 second 秒
+                px: Union[None, int, timedelta] = ..., 设置键的过期时间为 millisecond 毫秒
+                nx: bool = ..., 只有键不存在时，才对键进行设置操作
+                xx: bool = ..., 只有键已经存在时，才对键进行设置操作
+                keepttl: bool = ..., 保留键的过期时间
+        Returns:
+
+        """
         return self._redis.set(table, value, **kwargs)
 
     def str_incrby(self, table, value):
@@ -755,7 +845,6 @@ class RedisDB:
         ---------
         @result:
         """
-
         self._redis.expire(key, seconds)
 
     def get_expire(self, key):
@@ -777,3 +866,93 @@ class RedisDB:
 
     def get_redis_obj(self):
         return self._redis
+
+    def _reconnect(self):
+        # 检测连接状态, 当数据库重启或设置 timeout 导致断开连接时自动重连
+        retry_count = 0
+        while True:
+            try:
+                retry_count += 1
+                log.error(f"redis 连接断开, 重新连接 {retry_count}")
+                if self.get_connect():
+                    log.info(f"redis 连接成功")
+                    return True
+            except (ConnectionError, TimeoutError) as e:
+                log.error(f"连接失败 e: {e}")
+
+            time.sleep(2)
+
+    def __getattr__(self, name):
+        return getattr(self._redis, name)
+
+    def current_status(self, show_key=True, filter_key_by_used_memory=10 * 1024 * 1024):
+        """
+        统计redis当前使用情况
+        Args:
+            show_key: 是否统计每个key的内存
+            filter_key_by_used_memory: 根据内存的使用量过滤key 只显示使用量大于指定内存的key
+
+        Returns:
+
+        """
+        from prettytable import PrettyTable
+        from tqdm import tqdm
+
+        status_msg = ""
+
+        print("正在查询最大连接数...")
+        clients_count = self._redis.execute_command("info clients")
+        max_clients_count = self._redis.execute_command("config get maxclients")
+        status_msg += ": ".join(max_clients_count) + "\n"
+        status_msg += clients_count + "\n"
+
+        print("正在查询整体内存使用情况...")
+        total_status = self._redis.execute_command("info memory")
+        status_msg += total_status + "\n"
+
+        if show_key:
+            print("正在查询每个key占用内存情况等信息...")
+            table = PrettyTable(
+                field_names=[
+                    "type",
+                    "key",
+                    "value_count",
+                    "used_memory_human",
+                    "used_memory",
+                ],
+                sortby="used_memory",
+                reversesort=True,
+                header_style="title",
+            )
+
+            keys = self._redis.execute_command("keys *")
+            for key in tqdm(keys):
+                key_type = self._redis.execute_command("type {}".format(key))
+                if key_type == "set":
+                    value_count = self._redis.scard(key)
+                elif key_type == "zset":
+                    value_count = self._redis.zcard(key)
+                elif key_type == "list":
+                    value_count = self._redis.llen(key)
+                elif key_type == "hash":
+                    value_count = self._redis.hlen(key)
+                elif key_type == "string":
+                    value_count = self._redis.strlen(key)
+                elif key_type == "none":
+                    continue
+                else:
+                    raise TypeError("尚不支持 {} 类型的key".format(key_type))
+
+                used_memory = self._redis.execute_command("memory usage {}".format(key))
+                if used_memory >= filter_key_by_used_memory:
+                    used_memory_human = (
+                        "%0.2fMB" % (used_memory / 1024 / 1024) if used_memory else 0
+                    )
+
+                    table.add_row(
+                        [key_type, key, value_count, used_memory_human, used_memory]
+                    )
+
+            status_msg += str(table)
+
+        return status_msg

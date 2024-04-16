@@ -5,7 +5,7 @@ Created on 2018-06-19 17:17
 @summary: request 管理器， 负责缓冲添加到数据库中的request
 ---------
 @author: Boris
-@email: boris@bzkj.tech
+@email: boris_liu@foxmail.com
 """
 
 import collections
@@ -13,49 +13,67 @@ import threading
 
 import feapder.setting as setting
 import feapder.utils.tools as tools
+from feapder.db.memorydb import MemoryDB
 from feapder.db.redisdb import RedisDB
-from feapder.utils.log import log
 from feapder.dedup import Dedup
+from feapder.utils.log import log
 
 MAX_URL_COUNT = 1000  # 缓存中最大request数
 
 
-class Singleton(object):
-    def __new__(cls, *args, **kwargs):
-        if not hasattr(cls, "_inst"):
-            cls._inst = super(Singleton, cls).__new__(cls)
-
-        return cls._inst
-
-
-class RequestBuffer(threading.Thread, Singleton):
+class AirSpiderRequestBuffer:
     dedup = None
 
-    def __init__(self, redis_key):
-        if not hasattr(self, "_requests_deque"):
-            super(RequestBuffer, self).__init__()
+    def __init__(self, db=None, dedup_name: str = None):
+        self._db = db or MemoryDB()
 
-            self._thread_stop = False
-            self._is_adding_to_db = False
-
-            self._requests_deque = collections.deque()
-            self._del_requests_deque = collections.deque()
-            self._db = RedisDB()
-
-            self._table_request = setting.TAB_REQUSETS.format(redis_key=redis_key)
-            self._table_failed_request = setting.TAB_FAILED_REQUSETS.format(
-                redis_key=redis_key
-            )
-
-            if not self.__class__.dedup and setting.REQUEST_FILTER_ENABLE:
+        if not self.__class__.dedup and setting.REQUEST_FILTER_ENABLE:
+            if setting.REQUEST_FILTER_SETTING.get(
+                "filter_type"
+            ) == Dedup.BloomFilter or setting.REQUEST_FILTER_SETTING.get("name"):
                 self.__class__.dedup = Dedup(
-                    filter_type=Dedup.ExpireFilter,
-                    name=redis_key,
-                    expire_time=2592000,
-                    to_md5=False,
-                )  # 过期时间为一个月
+                    to_md5=False, **setting.REQUEST_FILTER_SETTING
+                )
+            else:
+                self.__class__.dedup = Dedup(
+                    to_md5=False, name=dedup_name, **setting.REQUEST_FILTER_SETTING
+                )
+
+    def is_exist_request(self, request):
+        if (
+            request.filter_repeat
+            and setting.REQUEST_FILTER_ENABLE
+            and not self.__class__.dedup.add(request.fingerprint)
+        ):
+            log.debug("request已存在  url = %s" % request.url)
+            return True
+        return False
+
+    def put_request(self, request, ignore_max_size=True):
+        if self.is_exist_request(request):
+            return
+        else:
+            self._db.add(request, ignore_max_size=ignore_max_size)
+
+
+class RequestBuffer(AirSpiderRequestBuffer, threading.Thread):
+    def __init__(self, redis_key):
+        AirSpiderRequestBuffer.__init__(self, db=RedisDB(), dedup_name=redis_key)
+        threading.Thread.__init__(self)
+
+        self._thread_stop = False
+        self._is_adding_to_db = False
+
+        self._requests_deque = collections.deque()
+        self._del_requests_deque = collections.deque()
+
+        self._table_request = setting.TAB_REQUESTS.format(redis_key=redis_key)
+        self._table_failed_request = setting.TAB_FAILED_REQUESTS.format(
+            redis_key=redis_key
+        )
 
     def run(self):
+        self._thread_stop = False
         while not self._thread_stop:
             try:
                 self.__add_request_to_db()
@@ -66,6 +84,7 @@ class RequestBuffer(threading.Thread, Singleton):
 
     def stop(self):
         self._thread_stop = True
+        self._started.clear()
 
     def put_request(self, request):
         self._requests_deque.append(request)
@@ -118,12 +137,7 @@ class RequestBuffer(threading.Thread, Singleton):
             priority = request.priority
 
             # 如果需要去重并且库中已重复 则continue
-            if (
-                request.filter_repeat
-                and setting.REQUEST_FILTER_ENABLE
-                and not self.__class__.dedup.add(request.fingerprint)
-            ):
-                log.debug("request已存在  url = %s" % request.url)
+            if self.is_exist_request(request):
                 continue
             else:
                 request_list.append(str(request.to_dict))

@@ -12,13 +12,14 @@ import getpass
 import os
 
 import feapder.utils.tools as tools
+from feapder import setting
 from feapder.db.mysqldb import MysqlDB
 from .create_init import CreateInit
 
 
 def deal_file_info(file):
     file = file.replace("{DATE}", tools.get_current_date())
-    file = file.replace("{USER}", getpass.getuser())
+    file = file.replace("{USER}", os.getenv("FEAPDER_USER") or getpass.getuser())
 
     return file
 
@@ -30,9 +31,7 @@ class CreateItem:
 
     def select_columns(self, table_name):
         # sql = 'SHOW COLUMNS FROM ' + table_name
-        sql = "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_KEY, COLUMN_COMMENT FROM INFORMATION_SCHEMA.Columns WHERE table_name = '{}'".format(
-            table_name
-        )
+        sql = f"SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_KEY, COLUMN_COMMENT FROM INFORMATION_SCHEMA.Columns WHERE table_name = '{table_name}' and table_schema = '{setting.MYSQL_DB}'"
         columns = self._db.find(sql)
 
         return columns
@@ -45,10 +44,7 @@ class CreateItem:
         ---------
         @result:
         """
-        sql = (
-            "select table_name from information_schema.tables where table_name like '%s'"
-            % tables_name
-        )
+        sql = f"select table_name from information_schema.tables where table_name like '{tables_name}' and table_schema = '{setting.MYSQL_DB}'"
         tables_name = self._db.find(sql)
 
         return tables_name
@@ -69,10 +65,15 @@ class CreateItem:
 
         return table_hump_format
 
-    def get_item_template(self):
-        template_path = os.path.abspath(
-            os.path.join(__file__, "../../../templates/item_template.tmpl")
-        )
+    def get_item_template(self, item_type):
+        if item_type == "Item":
+            template_path = os.path.abspath(
+                os.path.join(__file__, "../../../templates/item_template.tmpl")
+            )
+        else:
+            template_path = os.path.abspath(
+                os.path.join(__file__, "../../../templates/update_item_template.tmpl")
+            )
         with open(template_path, "r", encoding="utf-8") as file:
             item_template = file.read()
 
@@ -83,9 +84,10 @@ class CreateItem:
         # 组装 类名
         item_template = item_template.replace("${item_name}", table_name_hump_format)
         if support_dict:
-            item_template = item_template.replace("${table_name}", table_name + " 1")
+            item_template = item_template.replace("${command}", table_name + " 1")
         else:
-            item_template = item_template.replace("${table_name}", table_name)
+            item_template = item_template.replace("${command}", table_name)
+        item_template = item_template.replace("${table_name}", table_name)
 
         # 组装 属性
         propertys = ""
@@ -99,6 +101,7 @@ class CreateItem:
             column_comment = column[6]
 
             try:
+                column_default = None if column_default == "NULL" else column_default
                 value = (
                     "kwargs.get('{column_name}')".format(column_name=column_name)
                     if support_dict
@@ -147,9 +150,10 @@ class CreateItem:
             file.write(item_template)
             print("\n%s 生成成功" % item_file)
 
-        self._create_init.create()
+        if os.path.basename(os.path.dirname(os.path.abspath(item_file))) == "items":
+            self._create_init.create()
 
-    def create(self, tables_name, support_dict):
+    def create(self, tables_name, item_type, support_dict):
         input_tables_name = tables_name
 
         tables_name = self.select_tables_name(tables_name)
@@ -162,7 +166,7 @@ class CreateItem:
             table_name = table_name[0]
 
             columns = self.select_columns(table_name)
-            item_template = self.get_item_template()
+            item_template = self.get_item_template(item_type)
             item_template = self.create_item(
                 item_template, columns, table_name, support_dict
             )
