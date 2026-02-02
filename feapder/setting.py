@@ -27,6 +27,7 @@ MONGO_PORT = int(os.getenv("MONGO_PORT", 27017))
 MONGO_DB = os.getenv("MONGO_DB")
 MONGO_USER_NAME = os.getenv("MONGO_USER_NAME")
 MONGO_USER_PASS = os.getenv("MONGO_USER_PASS")
+MONGO_URL = os.getenv("MONGO_URL")
 
 # REDIS
 # ip:port 多个可写为列表或者逗号隔开 如 ip1:port1,ip2:port2 或 ["ip1:port1", "ip2:port2"]
@@ -42,8 +43,10 @@ REDISDB_SERVICE_NAME = os.getenv("REDISDB_SERVICE_NAME")
 ITEM_PIPELINES = [
     "feapder.pipelines.mysql_pipeline.MysqlPipeline",
     # "feapder.pipelines.mongo_pipeline.MongoPipeline",
+    # "feapder.pipelines.csv_pipeline.CsvPipeline",
     # "feapder.pipelines.console_pipeline.ConsolePipeline",
 ]
+CSV_EXPORT_PATH = "data/csv"  # CSV文件保存路径，支持相对路径和绝对路径
 EXPORT_DATA_MAX_FAILED_TIMES = 10  # 导出数据时最大的失败次数，包括保存和更新，超过这个次数报警
 EXPORT_DATA_MAX_RETRY_TIMES = 10  # 导出数据时最大的重试次数，包括保存和更新，超过这个次数则放弃重试
 
