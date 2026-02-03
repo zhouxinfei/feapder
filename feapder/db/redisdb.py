@@ -86,7 +86,7 @@ class RedisDB:
             user_pass = setting.REDISDB_USER_PASS
         if service_name is None:
             service_name = setting.REDISDB_SERVICE_NAME
-        if kwargs is None:
+        if not kwargs:
             kwargs = setting.REDISDB_KWARGS
 
         self._is_redis_cluster = False
